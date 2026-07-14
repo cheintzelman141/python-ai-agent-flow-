@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+
+# Runtime state and evidence belong outside the repository.
+*.db
+*.db-shm
+*.db-wal
+.agent-flow/
