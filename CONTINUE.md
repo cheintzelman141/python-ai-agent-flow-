@@ -130,6 +130,29 @@ so it does not authorize those earlier real launches. General execution stays
 disabled until a pre-launch, approval-consuming campaign/repository contract is
 proven before any investigator or guarded Git process can start.
 
+
+## Phase 2 admission-bound collector correction
+
+The current schema-v11 focused-test admission is also revalidated by the
+supervisor-owned browser and database collectors before they execute or
+canonicalize evidence. Browser guardian release now uses the same transactional
+release fence pattern as focused tests, so revocation and target launch have one
+durable ordering. The SQLite database collector is revalidated immediately
+before the bounded read and again before completion. Revocation remains allowed
+to clear, terminate, and reap already-recorded process groups; it does not
+authorize new browser launches or database reads.
+
+Schema-v12 extends the internal focused-test admission record for the fixed
+three-gate disposable pipeline by pinning the exact browser and database plan
+IDs and plan hashes. Revocation is serialized with browser release and database
+reads, and collector completion revalidates the same attempt-pinned authority.
+
+This correction does not expose general real-campaign execution. The missing
+pre-launch campaign/repository admission remains a separate future approval
+contract and must still consume an explicit operator approval before any general
+investigator, managed-worktree, fixer, tester, browser, or database boundary can
+run against a non-disposable target.
+
 ## Phase 2 pickup point
 
 Continue the real worker and environment adapters without weakening Phase 1's

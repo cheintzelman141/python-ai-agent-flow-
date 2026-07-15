@@ -133,6 +133,25 @@ class Storage(Protocol):
     ) -> ContextManager[None]:
         """Serialize focused guardian release against admission revocation."""
 
+    def browser_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        identity: ProcessIdentity,
+        target_executable: str,
+    ) -> ContextManager[None]:
+        """Serialize browser guardian release against admission revocation."""
+
+    def database_query_execution_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        contract: Mapping[str, Any],
+    ) -> ContextManager[Mapping[str, Any]]:
+        """Serialize database query execution against admission revocation."""
+
     def clear_external_process(
         self,
         job_id: str,
@@ -582,6 +601,13 @@ class Scheduler:
                     slot, job, identity, target_executable
                 )
 
+            def browser_guardian_release_fence(
+                identity: ProcessIdentity, target_executable: str
+            ) -> ContextManager[None]:
+                return self._browser_guardian_release_fence(
+                    slot, job, identity, target_executable
+                )
+
             def record_artifact(
                 kind: str, uri: str, metadata: Mapping[str, Any]
             ) -> None:
@@ -626,6 +652,11 @@ class Scheduler:
             def prepare_database_query_execution() -> Mapping[str, Any]:
                 return self._prepare_database_query_execution(slot, job)
 
+            def database_query_execution_fence(
+                contract: Mapping[str, Any],
+            ) -> ContextManager[Mapping[str, Any]]:
+                return self._database_query_execution_fence(slot, job, contract)
+
             def complete_database_query_execution(
                 result: Mapping[str, Any],
             ) -> Mapping[str, Any]:
@@ -641,6 +672,7 @@ class Scheduler:
                 _focused_test_guardian_release_fencer=(
                     focused_test_guardian_release_fence
                 ),
+                _browser_guardian_release_fencer=browser_guardian_release_fence,
                 _artifact_recorder=record_artifact,
                 _managed_worktree_provider=require_managed_worktree,
                 _managed_worktree_quarantiner=quarantine_managed_worktree,
@@ -654,6 +686,7 @@ class Scheduler:
                 ),
                 _database_query_execution_preparer=prepare_database_query_execution,
                 _database_query_execution_completer=complete_database_query_execution,
+                _database_query_execution_fencer=database_query_execution_fence,
             )
             output = await self._run_worker_with_heartbeat(slot, job, context)
             pending_interrupt = self._poll_operator_interrupt(slot, job)
@@ -804,6 +837,24 @@ class Scheduler:
             target_executable,
         )
 
+    def _browser_guardian_release_fence(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        identity: ProcessIdentity,
+        target_executable: str,
+    ) -> ContextManager[None]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        return self.storage.browser_guardian_release_fence(
+            job.id,
+            slot.worker_id,
+            lease_token,
+            identity,
+            target_executable,
+        )
+
     def _record_attempt_artifact(
         self,
         slot: _WorkerSlot,
@@ -909,6 +960,16 @@ class Scheduler:
                 "database-evidence preparation rejected the stale lease fence"
             )
         return prepared
+
+    def _database_query_execution_fence(
+        self, slot: _WorkerSlot, job: Job, contract: Mapping[str, Any]
+    ) -> ContextManager[Mapping[str, Any]]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        return self.storage.database_query_execution_fence(
+            job.id, slot.worker_id, lease_token, contract
+        )
 
     def _complete_database_query_execution(
         self,

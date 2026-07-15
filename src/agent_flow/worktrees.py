@@ -828,13 +828,13 @@ class GitInspector:
         ).stdout.split(b"\0")
         records: List[Dict[str, str]] = []
         current: Dict[str, str] = {}
-        for field in fields:
-            if not field:
+        for entry in fields:
+            if not entry:
                 if current:
                     records.append(current)
                     current = {}
                 continue
-            key, separator, value = field.partition(b" ")
+            key, separator, value = entry.partition(b" ")
             current[key.decode("ascii")] = (
                 value.decode("utf-8", errors="surrogateescape")
                 if separator

@@ -10,7 +10,6 @@ import os
 import shutil
 import signal
 import stat
-import subprocess
 import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path

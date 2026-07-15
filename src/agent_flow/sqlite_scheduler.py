@@ -19,6 +19,7 @@ from agent_flow.models import (
     WorkItem,
 )
 from agent_flow.process_reconciler import (
+    ProcessIdentity,
     ExternalProcessBinding,
     ExternalProcessReconciler,
     ReconciliationResult,
@@ -363,6 +364,27 @@ class SQLiteSchedulerStorage:
             target_executable,
         )
 
+    def browser_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        identity: "ProcessIdentity",
+        target_executable: str,
+    ) -> ContextManager[None]:
+        return self.store.browser_guardian_release_fence(
+            job_id,
+            worker_id,
+            lease_token,
+            identity.process_id,
+            identity.process_group_id,
+            identity.user_id,
+            identity.executable,
+            identity.start_seconds,
+            identity.start_microseconds,
+            target_executable,
+        )
+
     def clear_external_process(
         self,
         job_id: str,
@@ -477,6 +499,13 @@ class SQLiteSchedulerStorage:
             )
         except LeaseConflict:
             return None
+
+    def database_query_execution_fence(
+        self, job_id: str, worker_id: str, lease_token: str, contract: Mapping[str, Any]
+    ) -> ContextManager[Mapping[str, Any]]:
+        return self.store.database_query_execution_fence(
+            str(contract.get("id", "")), job_id, worker_id, lease_token
+        )
 
     def complete_database_query_execution(
         self,

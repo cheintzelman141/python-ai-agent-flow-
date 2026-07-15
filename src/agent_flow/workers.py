@@ -40,6 +40,9 @@ class WorkerContext:
     _focused_test_guardian_release_fencer: Optional[
         Callable[[ProcessIdentity, str], ContextManager[None]]
     ] = field(default=None, repr=False, compare=False)
+    _browser_guardian_release_fencer: Optional[
+        Callable[[ProcessIdentity, str], ContextManager[None]]
+    ] = field(default=None, repr=False, compare=False)
     _artifact_recorder: Optional[
         Callable[[str, str, Mapping[str, Any]], None]
     ] = field(default=None, repr=False, compare=False)
@@ -66,6 +69,9 @@ class WorkerContext:
     ] = field(default=None, repr=False, compare=False)
     _database_query_execution_completer: Optional[
         Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _database_query_execution_fencer: Optional[
+        Callable[[Mapping[str, Any]], ContextManager[Mapping[str, Any]]]
     ] = field(default=None, repr=False, compare=False)
 
     @property
@@ -120,6 +126,17 @@ class WorkerContext:
         return self._focused_test_guardian_release_fencer(
             identity, target_executable
         )
+
+    def browser_guardian_release_fence(
+        self, identity: ProcessIdentity, target_executable: str
+    ) -> ContextManager[None]:
+        """Serialize exact browser guardian release against admission revocation."""
+
+        if self._browser_guardian_release_fencer is None:
+            raise WorkerExecutionError(
+                "this worker context cannot authorize browser guardian release"
+            )
+        return self._browser_guardian_release_fencer(identity, target_executable)
 
     def record_artifact(
         self, kind: str, uri: str, metadata: Mapping[str, Any]
@@ -229,6 +246,17 @@ class WorkerContext:
                 "database-evidence preparation returned an invalid contract"
             )
         return prepared
+
+    def database_query_execution_fence(
+        self, contract: Mapping[str, Any]
+    ) -> ContextManager[Mapping[str, Any]]:
+        """Serialize the exact database read against admission revocation."""
+
+        if self._database_query_execution_fencer is None:
+            raise WorkerExecutionError(
+                "this worker context cannot authorize database query execution"
+            )
+        return self._database_query_execution_fencer(contract)
 
     def complete_database_query_execution(
         self, result: Mapping[str, Any]

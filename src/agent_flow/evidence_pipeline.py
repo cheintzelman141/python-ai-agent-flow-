@@ -56,22 +56,24 @@ class EvidencePipelineWorker:
             )
 
         database_contract = dict(context.prepare_database_query_execution())
-        database_task = asyncio.create_task(
-            asyncio.to_thread(
-                self.database_collector.collect,
-                database_contract,
+        with context.database_query_execution_fence(database_contract) as authorized_contract:
+            database_contract = dict(authorized_contract)
+            database_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.database_collector.collect,
+                    database_contract,
+                )
             )
-        )
-        try:
-            database_result = await asyncio.shield(database_task)
-        except asyncio.CancelledError:
-            # The query is read-only and bounded.  Do not release its resource
-            # fence while a background thread can still be using it.
             try:
-                await asyncio.shield(database_task)
-            except Exception:
-                pass
-            raise
+                database_result = await asyncio.shield(database_task)
+            except asyncio.CancelledError:
+                # The query is read-only and bounded.  Do not release its resource
+                # fence while a background thread can still be using it.
+                try:
+                    await asyncio.shield(database_task)
+                except Exception:
+                    pass
+                raise
         database = dict(
             context.complete_database_query_execution(database_result)
         )
@@ -147,6 +149,7 @@ class EvidencePipelineWorker:
                     "browser_evidence", identity, target
                 ),
                 clear_process=context.clear_external_process,
+                release_fence=context.browser_guardian_release_fence,
                 cancellation_event=cancellation_event,
             )
 
