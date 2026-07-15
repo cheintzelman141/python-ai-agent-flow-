@@ -36,6 +36,12 @@ class WorkerContext:
     _managed_worktree_quarantiner: Optional[Callable[[str], bool]] = field(
         default=None, repr=False, compare=False
     )
+    _focused_test_execution_preparer: Optional[
+        Callable[[], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _focused_test_execution_completer: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
 
     @property
     def item_id(self) -> str:
@@ -111,6 +117,36 @@ class WorkerContext:
             raise WorkerExecutionError(
                 "managed worktree quarantine rejected the stale lease fence"
             )
+
+    def prepare_focused_test_execution(self) -> Mapping[str, Any]:
+        """Request the supervisor-owned command for this exact attempt."""
+
+        if self._focused_test_execution_preparer is None:
+            raise WorkerExecutionError(
+                "this worker context has no focused-test execution authority"
+            )
+        prepared = self._focused_test_execution_preparer()
+        if not isinstance(prepared, Mapping):
+            raise WorkerExecutionError(
+                "focused-test preparation returned an invalid command contract"
+            )
+        return prepared
+
+    def complete_focused_test_execution(
+        self, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Submit captured process evidence through the current attempt fence."""
+
+        if self._focused_test_execution_completer is None:
+            raise WorkerExecutionError(
+                "this worker context has no focused-test completion authority"
+            )
+        completed = self._focused_test_execution_completer(result)
+        if not isinstance(completed, Mapping):
+            raise WorkerExecutionError(
+                "focused-test completion returned an invalid canonical result"
+            )
+        return completed
 
 
 WorkerOutput = Union[BaseModel, Mapping[str, Any]]

@@ -210,6 +210,9 @@ def _external_session_table(attempts: Sequence[Record], as_of: datetime) -> Tabl
     table.add_column("PID / PGID", justify="right")
     table.add_column("Lifecycle")
     for attempt in external_attempts:
+        provider = _value(attempt, "external_provider", None) or _value(
+            attempt, "external_process_provider", "-"
+        )
         attempt_state = _string_value(attempt, "status", "unknown")
         lease_expiry = _parse_timestamp(
             _value(attempt, "lease_expires_at", None)
@@ -225,7 +228,7 @@ def _external_session_table(attempts: Sequence[Record], as_of: datetime) -> Tabl
         )
         table.add_row(
             _string_value(attempt, "id", "-"),
-            _string_value(attempt, "external_provider", "-"),
+            str(provider),
             _string_value(attempt, "external_session_id", "-"),
             "%s / %s"
             % (

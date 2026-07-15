@@ -128,6 +128,20 @@ class Storage(Protocol):
     ) -> bool:
         """Register a durable artifact against the current fenced attempt."""
 
+    def prepare_focused_test_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        """Prepare the immutable focused-test request for this tester attempt."""
+
+    def complete_focused_test_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """Validate and persist authoritative focused-test output."""
+
     def commit_stage_result(
         self,
         *,
@@ -523,6 +537,14 @@ class Scheduler:
                     reason,
                 )
 
+            def prepare_focused_test_execution() -> Mapping[str, Any]:
+                return self._prepare_focused_test_execution(slot, job)
+
+            def complete_focused_test_execution(
+                result: Mapping[str, Any],
+            ) -> Mapping[str, Any]:
+                return self._complete_focused_test_execution(slot, job, result)
+
             context = WorkerContext(
                 campaign=campaign,
                 item=item,
@@ -533,6 +555,8 @@ class Scheduler:
                 _artifact_recorder=record_artifact,
                 _managed_worktree_provider=require_managed_worktree,
                 _managed_worktree_quarantiner=quarantine_managed_worktree,
+                _focused_test_execution_preparer=prepare_focused_test_execution,
+                _focused_test_execution_completer=complete_focused_test_execution,
             )
             output = await self._run_worker_with_heartbeat(slot, job, context)
             handoff = _validate_and_bind_output(job.role, job.item_id, output)
@@ -659,6 +683,42 @@ class Scheduler:
         )
         if not accepted:
             raise LeaseLost("artifact registration rejected the stale lease fence")
+
+    def _prepare_focused_test_execution(
+        self, slot: _WorkerSlot, job: Job
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        prepared = self.storage.prepare_focused_test_execution(
+            job.id, slot.worker_id, lease_token
+        )
+        if prepared is None:
+            raise LeaseLost(
+                "focused-test preparation rejected the stale lease fence"
+            )
+        return prepared
+
+    def _complete_focused_test_execution(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        result: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        completed = self.storage.complete_focused_test_execution(
+            job.id,
+            slot.worker_id,
+            lease_token,
+            result,
+        )
+        if completed is None:
+            raise LeaseLost(
+                "focused-test completion rejected the stale lease fence"
+            )
+        return completed
 
     async def _run_worker_with_heartbeat(
         self,

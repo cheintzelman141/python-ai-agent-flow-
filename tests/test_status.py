@@ -175,6 +175,29 @@ def test_status_displays_external_session_and_quarantined_process() -> None:
     assert "Quarantined" in section
 
 
+def test_status_uses_process_provider_when_worker_has_no_session() -> None:
+    data = list(snapshots())
+    data[3].append(
+        {
+            "id": "attempt-focused-test",
+            "status": "succeeded",
+            "external_process_provider": "focused_test",
+            "external_process_id": 43211,
+            "external_process_group_id": 43211,
+            "external_process_state": "stopped",
+        }
+    )
+
+    text = render(tuple(data))
+    section = text[
+        text.index("External worker sessions") : text.index("Resource leases")
+    ]
+
+    assert "attempt-focused-test" in section
+    assert "focused_test" in section
+    assert "43211" in section
+
+
 def test_repeated_rendering_is_deterministic_and_does_not_mutate_snapshots() -> None:
     data = snapshots()
     before = deepcopy(data)

@@ -560,10 +560,13 @@ def prove_real_codex(
     acknowledge_live_model: bool = typer.Option(
         False,
         "--acknowledge-live-model",
-        help="Run three authenticated Codex stages against a fixed disposable fixture.",
+        help=(
+            "Run authenticated Codex investigation/fixing plus an authoritative "
+            "focused-test collector against a fixed disposable fixture."
+        ),
     ),
 ) -> None:
-    """Run the fixed authenticated investigator/fixer/tester acceptance proof."""
+    """Run the fixed Codex-to-authoritative-test acceptance proof."""
 
     if not acknowledge_live_model:
         raise typer.BadParameter(
@@ -591,8 +594,8 @@ def prove_real_codex(
         ),
     )
     table.add_row(
-        "Tester command",
-        str(result.report.get("tester_command_proof") is True),
+        "Focused-test authority",
+        str(result.report.get("focused_test_execution_proof") is True),
     )
     table.add_row(
         "SQLite integrity",

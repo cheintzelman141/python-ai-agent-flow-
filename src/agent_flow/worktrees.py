@@ -216,6 +216,7 @@ class GuardedGitCommandRunner:
         artifact_directory: Path,
         record_process: Callable[[ProcessIdentity, str], None],
         clear_process: Callable[[int, int], None],
+        cancellation_event: Optional[threading.Event] = None,
     ) -> GuardedCommandResult:
         if not command or not Path(command[0]).is_absolute():
             raise ValueError("guarded command requires an absolute executable")
@@ -272,6 +273,10 @@ class GuardedGitCommandRunner:
             self._wait_or_kill_unreleased(process)
             raise
 
+        cancelled_before_release = bool(
+            cancellation_event is not None and cancellation_event.is_set()
+        )
+
         stdout_capture = _CaptureThread(
             process.stdout, stdout_path, self.max_output_bytes
         )
@@ -299,14 +304,20 @@ class GuardedGitCommandRunner:
         status_thread = threading.Thread(target=read_status, daemon=True)
         status_thread.start()
         release_error: Optional[BaseException] = None
-        try:
-            os.write(barrier_write_fd, b"1")
-        except BaseException as error:
-            release_error = error
-        finally:
+        cancelled_before_release = cancelled_before_release or bool(
+            cancellation_event is not None and cancellation_event.is_set()
+        )
+        if cancelled_before_release:
             self._close_fd(barrier_write_fd)
+        else:
+            try:
+                os.write(barrier_write_fd, b"1")
+            except BaseException as error:
+                release_error = error
+            finally:
+                self._close_fd(barrier_write_fd)
 
-        if release_error is not None:
+        if release_error is not None or cancelled_before_release:
             try:
                 process.wait(timeout=self.terminate_grace_seconds)
                 if not self._wait_for_group_exit(identity.process_group_id):
@@ -333,6 +344,11 @@ class GuardedGitCommandRunner:
                 stdout_truncated=stdout_capture.truncated,
                 stderr_truncated=stderr_capture.truncated,
             )
+            if cancelled_before_release:
+                raise GitCommandError(
+                    "guarded command was cancelled before release",
+                    result=result,
+                )
             raise GitCommandError(
                 "could not release the durably registered Git guardian",
                 result=result,
@@ -340,7 +356,11 @@ class GuardedGitCommandRunner:
 
         deadline = time.monotonic() + self.timeout_seconds
         timed_out = False
+        cancelled = False
         while status_thread.is_alive():
+            if cancellation_event is not None and cancellation_event.is_set():
+                cancelled = True
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -352,7 +372,9 @@ class GuardedGitCommandRunner:
                 process,
                 identity,
                 control_write_fd,
-                child_completed=not timed_out and "return_code" in status,
+                child_completed=(
+                    not timed_out and not cancelled and "return_code" in status
+                ),
             )
         finally:
             self._close_fd(control_write_fd)
@@ -375,6 +397,10 @@ class GuardedGitCommandRunner:
             raise GitCommandError(
                 "Git command timed out after %.1f seconds" % self.timeout_seconds,
                 result=result,
+            )
+        if cancelled:
+            raise GitCommandError(
+                "guarded command was cancelled", result=result
             )
         if "error" in status or "return_code" not in status:
             error = GitCommandError(

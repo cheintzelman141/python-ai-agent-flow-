@@ -44,9 +44,10 @@ claim that a real browser or database was exercised.
 
 ## Phase 2 status
 
-Phase 2 has started with a real, least-privilege Codex CLI vertical slice:
+Phase 2 has started with real, least-privilege Codex workers and a deterministic
+focused-test collector:
 
-- investigators and testers are forced into read-only sandboxes;
+- investigators are forced into read-only sandboxes;
 - real fixers require a scheduler-fenced managed-worktree ID; payload paths
   cannot authorize writes;
 - the tester successor inherits and validates the same exact managed worktree;
@@ -85,19 +86,31 @@ Phase 2 has started with a real, least-privilege Codex CLI vertical slice:
 - the status board and explicit lifecycle CLI expose worktrees, operations,
   process state, artifact hashes, and blockers.
 
-The fixed authenticated acceptance command is now green. It created its own
-private disposable repository, ran a source-only investigator, an approved
-managed-worktree fixer, and a read-only tester through Scheduler and SQLite,
-then independently proved the exact focused-test command, unchanged source,
-one-file worktree diff, three distinct provider sessions, process-group reap,
-artifact hashes, released leases, and SQLite foreign-key integrity.
+The fixed authenticated acceptance command creates its own private disposable
+repository, runs a source-only Codex investigator and an approved managed-
+worktree Codex fixer, then gives testing to a deterministic focused-test worker.
+The supervisor, not an LLM, owns that test command and persists its immutable,
+revisioned plan snapshot, managed-worktree generation, process identity,
+bounded stdout/stderr, hashes, semantic result, and canonical test handoff
+before the item can become green. A RED result can return through the fixer and
+receive a new plan revision; the trusted executable, test bytes, selector,
+environment, and limits cannot change between revisions.
+The final assessment reconciles the exact one-file diff, two distinct Codex
+sessions, all three reaped process groups, authoritative test execution,
+artifact hashes, released leases, unchanged source, and SQLite foreign-key
+integrity.
 
 The real adapter is intentionally not exposed as a general campaign CLI yet.
 The managed-worktree lifecycle and fixed proof command are available to
-operators, but evidence collectors for arbitrary focused tests, visible Chrome,
-application databases, and GL remain unimplemented. General real-worker
-execution stays disabled until those collectors prove what ran and what passed;
-this project does not yet claim end-to-end production-line green.
+operators, but focused-test authority is limited to that command's exact trusted
+fixture. The storage schema and worker API do not authorize arbitrary repository
+test code: the collector does not yet block same-user filesystem access,
+network access, or detached subprocesses, and transcript parsing is not a
+trusted general test harness. Visible Chrome, application-database, and GL
+collectors also remain unimplemented. General real-worker execution stays
+disabled until an OS sandbox or trusted harness and those evidence collectors
+prove what ran and what passed; this project does not yet claim end-to-end
+production-line green.
 
 ## Development
 
@@ -191,8 +204,9 @@ PYTHONPATH=src python3 -m agent_flow.cli worktree-cleanup WORKTREE_ID
 ```
 
 Run the live-provider acceptance proof only with explicit acknowledgement. It
-accepts no repository, database, worktree, or command paths and retains its
-private `/private/tmp/agent-flow-real-proof-*` report for audit:
+accepts no repository, database, worktree, or command paths, invokes Codex only
+for investigation and fixing, and retains its private
+`/private/tmp/agent-flow-real-proof-*` report for audit:
 
 ```bash
 PYTHONPATH=src python3 -m agent_flow.cli prove-real-codex \

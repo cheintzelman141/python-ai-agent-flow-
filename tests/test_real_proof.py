@@ -4,7 +4,6 @@ import asyncio
 import json
 import os
 from pathlib import Path
-import shlex
 import stat
 
 from typer.testing import CliRunner
@@ -37,41 +36,24 @@ class DeterministicProofWorker:
             }
         worktree = context.require_managed_worktree()
         worktree_path = Path(str(worktree["worktree_path"]))
-        if self.role == WorkerRole.FIXER:
-            (worktree_path / "calculator.py").write_text(
-                "def add(left: int, right: int) -> int:\n"
-                "    return left + right\n",
-                encoding="utf-8",
-            )
-            return {
-                "schema_version": 1,
-                "item_id": context.item_id,
-                "outcome": "ready_for_test",
-                "summary": "Changed the bounded arithmetic operation to addition.",
-                "changed_files": ["calculator.py"],
-                "tests_run": ["python3 -B -m unittest -v"],
-                "tester_instructions": ["Run the focused unittest."],
-                "evidence": [
-                    self._evidence(worktree_path / "test_calculator.py")
-                ],
-                "blocker": None,
-            }
+        (worktree_path / "calculator.py").write_text(
+            "def add(left: int, right: int) -> int:\n"
+            "    return left + right\n",
+            encoding="utf-8",
+        )
         return {
             "schema_version": 1,
             "item_id": context.item_id,
-            "outcome": "pass",
-            "summary": "The focused addition test passes.",
-            "gate_proofs": [
-                {
-                    "gate": "focused_tests",
-                    "result": "pass",
-                    "summary": "The focused unittest passed.",
-                    "evidence": [
-                        self._evidence(worktree_path / "test_calculator.py")
-                    ],
-                }
+            "outcome": "ready_for_test",
+            "summary": "Changed the bounded arithmetic operation to addition.",
+            "changed_files": ["calculator.py"],
+            "tests_run": [],
+            "tester_instructions": [
+                "Use Agent Flow's immutable focused-test plan."
             ],
-            "failure_summary": None,
+            "evidence": [
+                self._evidence(worktree_path / "test_calculator.py")
+            ],
             "blocker": None,
         }
 
@@ -85,19 +67,22 @@ class DeterministicProofWorker:
         }
 
 
-def _worker_factory(
-    role: WorkerRole, _config: CodexCliConfig
-) -> DeterministicProofWorker:
-    return DeterministicProofWorker(role)
-
-
 def test_fixed_proof_orchestrates_managed_flow_without_provider_claims(
     tmp_path: Path,
 ) -> None:
     proof_root = tmp_path / "fixed-proof"
+    provider_roles = []
+
+    def worker_factory(
+        role: WorkerRole, config: CodexCliConfig
+    ) -> DeterministicProofWorker:
+        del config
+        provider_roles.append(role)
+        return DeterministicProofWorker(role)
+
     runner = RealProofRunner(
         root=proof_root,
-        worker_factory=_worker_factory,
+        worker_factory=worker_factory,
         require_authenticated_provider=False,
     )
 
@@ -112,9 +97,12 @@ def test_fixed_proof_orchestrates_managed_flow_without_provider_claims(
     assert result.report["same_worktree_fixer_tester"] is True
     assert result.report["provider_checks_skipped"] is True
     assert result.report["sessions_distinct_and_persisted"] is False
+    assert result.report["focused_test_execution_proof"] is True
+    assert provider_roles == [WorkerRole.INVESTIGATOR, WorkerRole.FIXER]
+    assert len(result.report["focused_test_plans"]) == 1
+    assert len(result.report["focused_test_executions"]) == 1
     assert result.report["resource_leases"] == []
     assert result.report["foreign_key_violations"] == []
-    assert result.report["supervisor_focused_test"]["return_code"] == 0
     assert result.report["scheduler_error_free"] is True
     assert result.report["executable_hashes_unchanged"] is True
     assert Path(result.report["guardian_executable"]["path"]).is_absolute()
@@ -125,7 +113,7 @@ def test_fixed_proof_orchestrates_managed_flow_without_provider_claims(
 
     failed = dict(result.report)
     failed["scheduler_error_free"] = False
-    assert not all(runner._core_requirements(failed, 0))
+    assert not all(runner._core_requirements(failed))
 
     failed_attempts = [dict(attempt) for attempt in result.report["attempts"]]
     failed_attempts[0]["status"] = "failed"
@@ -175,6 +163,19 @@ def test_fixed_proof_orchestrates_managed_flow_without_provider_claims(
         cwd=worktree,
     )
 
+    tampered_execution = dict(result.report["focused_test_executions"][0])
+    tampered_execution["exit_code"] = 1
+    assert runner._focused_test_execution_proof(
+        result.report["focused_test_plans"],
+        [tampered_execution],
+        result.report["jobs"],
+        result.report["attempts"],
+        result.report["artifacts"],
+        result.report["events"],
+        worktree,
+        result.report,
+    ) is False
+
 
 def test_real_proof_cli_requires_explicit_live_model_acknowledgement() -> None:
     result = CliRunner().invoke(app, ["prove-real-codex"])
@@ -182,56 +183,6 @@ def test_real_proof_cli_requires_explicit_live_model_acknowledgement() -> None:
     assert result.exit_code != 0
     assert "--acknowledge-live-model is required" in result.output
     assert "agent-flow-real-proof-" not in result.output
-
-
-def test_tester_command_proof_rejects_substrings_and_requires_test_output(
-    tmp_path: Path,
-) -> None:
-    runner = RealProofRunner(root=tmp_path / "proof")
-    jsonl = tmp_path / "tester.jsonl"
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    tester = {"id": "tester-job", "role": "tester"}
-    artifacts = [
-        {"job_id": "tester-job", "kind": "codex_jsonl", "uri": str(jsonl)}
-    ]
-    exact = runner._focused_command_text
-
-    _write_command_event(
-        jsonl,
-        "/bin/zsh -lc %s" % shlex.quote("echo %s" % shlex.quote(exact)),
-        _test_output(worktree),
-    )
-    assert runner._tester_command_proof(
-        [tester], artifacts, worktree
-    ) is False
-
-    _write_command_event(
-        jsonl,
-        "/bin/zsh -lc %s" % shlex.quote(exact),
-        _test_output(worktree),
-    )
-    assert runner._tester_command_proof(
-        [tester], artifacts, worktree
-    ) is True
-
-    _write_command_event(
-        jsonl,
-        "/bin/zsh -lc %s" % shlex.quote(exact),
-        _test_output(tmp_path / "other-worktree"),
-    )
-    assert runner._tester_command_proof(
-        [tester], artifacts, worktree
-    ) is False
-
-    _write_command_event(
-        jsonl,
-        "/bin/zsh -lc %s" % shlex.quote(exact),
-        "not a unittest result\n",
-    )
-    assert runner._tester_command_proof(
-        [tester], artifacts, worktree
-    ) is False
 
 
 def test_provider_artifacts_bind_job_attempt_and_jsonl_session(
@@ -244,16 +195,16 @@ def test_provider_artifacts_bind_job_attempt_and_jsonl_session(
     worktree = root / "worktree"
     worktree.mkdir(mode=0o700)
     artifact_root = runner._attempt_runtime_directory(
-        "campaign-proof", "tester-job", "tester-attempt"
+        "campaign-proof", "investigator-job", "investigator-attempt"
     )
     artifact_root.mkdir(mode=0o700, parents=True)
-    job = {"id": "tester-job", "role": "tester"}
+    job = {"id": "investigator-job", "role": "investigator"}
     attempt = {
-        "id": "tester-attempt",
-        "job_id": "tester-job",
+        "id": "investigator-attempt",
+        "job_id": "investigator-job",
         "external_session_id": "persisted-session",
         "external_process_target_executable": "/private/tmp/codex",
-        "result": _tester_result(),
+        "result": _investigator_result(),
     }
     report = {
         "campaign_id": "campaign-proof",
@@ -307,7 +258,7 @@ def test_provider_artifacts_bind_job_attempt_and_jsonl_session(
         if artifact["kind"] == "codex_jsonl"
     )
     jsonl_path = Path(str(jsonl_artifact["uri"]))
-    wrong_result = _tester_result()
+    wrong_result = _investigator_result()
     wrong_result["summary"] = "Wrong final handoff."
     jsonl_path.write_text(
         "\n".join(
@@ -416,10 +367,19 @@ def test_process_proof_rejects_incomplete_darwin_identity(tmp_path: Path) -> Non
     report = {
         "guardian_executable": {"path": str(runner.guardian_executable)},
         "codex_executable": {"path": "/private/tmp/codex"},
+        "python_executable": {"path": str(runner.python_executable)},
     }
+    jobs = [
+        {"id": "investigator-job", "role": "investigator"},
+        {"id": "fixer-job", "role": "fixer"},
+        {"id": "tester-job", "role": "tester"},
+    ]
+    complete.update({"id": "investigator-attempt", "job_id": "investigator-job"})
     second = dict(complete)
     second.update(
         {
+            "id": "fixer-attempt",
+            "job_id": "fixer-job",
             "external_process_id": 201,
             "external_process_group_id": 201,
             "external_process_start_microseconds": 2,
@@ -428,55 +388,66 @@ def test_process_proof_rejects_incomplete_darwin_identity(tmp_path: Path) -> Non
     third = dict(complete)
     third.update(
         {
+            "id": "tester-attempt",
+            "job_id": "tester-job",
             "external_process_id": 202,
             "external_process_group_id": 202,
             "external_process_start_microseconds": 3,
+            "external_provider": "focused_test",
+            "external_process_target_executable": str(
+                runner.python_executable
+            ),
         }
     )
+    attempts = [complete, second, third]
+    processes = [_process_from_attempt(attempt) for attempt in attempts]
 
     assert runner._all_processes_stopped(
-        [complete, second, third], report
+        jobs, attempts, processes, report
     ) is True
 
-    wrong_guardian = dict(complete)
-    wrong_guardian["external_process_executable"] = "/bin/ls"
+    wrong_guardian = dict(processes[0])
+    wrong_guardian["kernel_executable"] = "/bin/ls"
     assert runner._all_processes_stopped(
-        [wrong_guardian, second, third], report
+        jobs, attempts, [wrong_guardian, *processes[1:]], report
     ) is False
 
     failed = dict(complete)
     failed["status"] = "failed"
     failed["error"] = "failure"
     assert runner._all_processes_stopped(
-        [failed, second, third], report
+        jobs, [failed, second, third], processes, report
     ) is False
 
-    incomplete = dict(complete)
-    incomplete.pop("external_process_start_seconds")
+    incomplete = dict(processes[0])
+    incomplete.pop("start_seconds")
 
     assert runner._all_processes_stopped(
-        [incomplete, second, third], report
+        jobs, attempts, [incomplete, *processes[1:]], report
     ) is False
 
     assert runner._all_processes_stopped(
-        [complete, complete, complete], report
+        jobs, attempts, [processes[0], processes[0], processes[0]], report
     ) is False
 
 
 def test_session_events_bind_exact_attempt_identity(tmp_path: Path) -> None:
     runner = RealProofRunner(root=tmp_path / "proof")
-    job = {"id": "tester-job", "role": "tester"}
+    job = {"id": "investigator-job", "role": "investigator"}
     attempt = _complete_process_attempt(runner)
     attempt.update(
         {
-            "job_id": "tester-job",
+            "id": "investigator-attempt",
+            "job_id": "investigator-job",
             "external_session_id": "session-1",
         }
     )
-    events = _identity_events(attempt)
+    events = _identity_events(
+        attempt, job_id="investigator-job", completion="investigation_completed"
+    )
 
     assert runner._session_events_precede_completion(
-        [job], [attempt], events
+        [job], [attempt], [_process_from_attempt(attempt)], events
     ) is True
 
     events[1]["event_data"] = {
@@ -484,25 +455,25 @@ def test_session_events_bind_exact_attempt_identity(tmp_path: Path) -> None:
         "session_id": "wrong-session",
     }
     assert runner._session_events_precede_completion(
-        [job], [attempt], events
+        [job], [attempt], [_process_from_attempt(attempt)], events
     ) is False
 
 
 def test_artifact_events_bind_rows_before_process_stop() -> None:
-    job = {"id": "tester-job", "role": "tester"}
+    job = {"id": "investigator-job", "role": "investigator"}
     artifacts = [
         {
             "id": "artifact-%d" % index,
-            "job_id": "tester-job",
+            "job_id": "investigator-job",
             "kind": kind,
             "uri": "/private/tmp/%s" % PROVIDER_ARTIFACT_NAMES[kind],
-            "metadata": {"attempt_id": "tester-attempt"},
+            "metadata": {"attempt_id": "investigator-attempt"},
         }
         for index, kind in enumerate(sorted(PROVIDER_ARTIFACT_NAMES), start=1)
     ]
     events = [
         {
-            "job_id": "tester-job",
+            "job_id": "investigator-job",
             "event_type": "worker.external_session_recorded",
             "sequence": 1,
             "event_data": {},
@@ -510,12 +481,12 @@ def test_artifact_events_bind_rows_before_process_stop() -> None:
     ]
     events.extend(
         {
-            "job_id": "tester-job",
+            "job_id": "investigator-job",
             "event_type": "artifact.added",
             "sequence": index + 1,
             "event_data": {
                 "artifact_id": artifact["id"],
-                "attempt_id": "tester-attempt",
+                "attempt_id": "investigator-attempt",
                 "kind": artifact["kind"],
                 "uri": artifact["uri"],
             },
@@ -524,7 +495,7 @@ def test_artifact_events_bind_rows_before_process_stop() -> None:
     )
     events.append(
         {
-            "job_id": "tester-job",
+            "job_id": "investigator-job",
             "event_type": "worker.external_process_stopped",
             "sequence": 6,
             "event_data": {},
@@ -600,37 +571,10 @@ def test_executable_hash_drift_fails_closed(tmp_path: Path) -> None:
     assert runner.executable_baselines["python_executable"]["sha256"]
 
 
-def _write_command_event(path: Path, command: str, output: str) -> None:
-    path.write_text(
-        json.dumps(
-            {
-                "type": "item.completed",
-                "item": {
-                    "type": "command_execution",
-                    "command": command,
-                    "aggregated_output": output,
-                    "exit_code": 0,
-                    "status": "completed",
-                },
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def _write_jsonl_events(path: Path, events: list) -> None:
     path.write_text(
         "".join(json.dumps(event) + "\n" for event in events),
         encoding="utf-8",
-    )
-
-
-def _test_output(worktree: Path) -> str:
-    return (
-        "test_adds_two_numbers ... ok\n"
-        "AGENT_FLOW_TEST_FILE=%s\n"
-        "Ran 1 test\nOK\n" % (worktree / "test_calculator.py")
     )
 
 
@@ -658,7 +602,7 @@ def _provider_artifacts(
                             "item": {
                                 "type": "agent_message",
                                 "text": json.dumps(
-                                    _tester_result(), sort_keys=True
+                                    _investigator_result(), sort_keys=True
                                 ),
                             },
                         }
@@ -668,22 +612,22 @@ def _provider_artifacts(
             ) + "\n"
         elif kind == "codex_schema":
             payload = json.dumps(
-                codex_handoff_schema(WorkerRole.TESTER), sort_keys=True
+                codex_handoff_schema(WorkerRole.INVESTIGATOR), sort_keys=True
             ) + "\n"
         elif kind == "codex_final":
-            payload = json.dumps(_tester_result(), sort_keys=True) + "\n"
+            payload = json.dumps(_investigator_result(), sort_keys=True) + "\n"
         else:
             payload = ""
         path.write_text(payload, encoding="utf-8")
         path.chmod(0o600)
         artifacts.append(
             {
-                "job_id": "tester-job",
+                "job_id": "investigator-job",
                 "item_id": "item-proof",
                 "kind": kind,
                 "uri": str(path),
                 "metadata": {
-                    "attempt_id": "tester-attempt",
+                    "attempt_id": "investigator-attempt",
                     "provider": "codex",
                     "executable": "/private/tmp/codex",
                     "sandbox": "read-only",
@@ -718,10 +662,31 @@ def _complete_process_attempt(runner: RealProofRunner) -> dict:
     }
 
 
-def _identity_events(attempt: dict) -> list:
+def _process_from_attempt(attempt: dict) -> dict:
+    return {
+        "attempt_id": attempt["id"],
+        "provider": attempt["external_provider"],
+        "process_id": attempt["external_process_id"],
+        "process_group_id": attempt["external_process_group_id"],
+        "owner_uid": attempt["external_process_owner_uid"],
+        "start_seconds": attempt["external_process_start_seconds"],
+        "start_microseconds": attempt["external_process_start_microseconds"],
+        "kernel_executable": attempt["external_process_executable"],
+        "target_executable": attempt["external_process_target_executable"],
+        "identity_version": attempt["external_process_identity_version"],
+        "state": attempt["external_process_state"],
+        "outcome": attempt["external_process_outcome"],
+        "stopped_at": attempt["external_process_stopped_at"],
+        "last_error": attempt["external_process_last_error"],
+    }
+
+
+def _identity_events(
+    attempt: dict, *, job_id: str, completion: str
+) -> list:
     return [
         {
-            "job_id": "tester-job",
+            "job_id": job_id,
             "event_type": "worker.external_process_started",
             "sequence": 1,
             "event_data": {
@@ -740,7 +705,7 @@ def _identity_events(attempt: dict) -> list:
             },
         },
         {
-            "job_id": "tester-job",
+            "job_id": job_id,
             "event_type": "worker.external_session_recorded",
             "sequence": 2,
             "event_data": {
@@ -749,7 +714,7 @@ def _identity_events(attempt: dict) -> list:
             },
         },
         {
-            "job_id": "tester-job",
+            "job_id": job_id,
             "event_type": "worker.external_process_stopped",
             "sequence": 3,
             "event_data": {
@@ -758,8 +723,8 @@ def _identity_events(attempt: dict) -> list:
             },
         },
         {
-            "job_id": "tester-job",
-            "event_type": "test_verified_green",
+            "job_id": job_id,
+            "event_type": completion,
             "sequence": 4,
             "event_data": {},
         },
@@ -789,5 +754,28 @@ def _tester_result() -> dict:
             }
         ],
         "failure_summary": None,
+        "blocker": None,
+    }
+
+
+def _investigator_result() -> dict:
+    return {
+        "schema_version": 1,
+        "item_id": "item-proof",
+        "outcome": "ready_for_fix",
+        "synopsis": "The focused addition test fails on subtraction.",
+        "reproduction_steps": ["Inspect the focused unittest."],
+        "root_cause": "calculator.add subtracts the right operand.",
+        "proposed_fix": "Return left plus right in calculator.add.",
+        "acceptance_criteria": ["The focused unittest passes."],
+        "evidence": [
+            {
+                "id": "test-proof",
+                "kind": "test",
+                "location": "/private/tmp/test_calculator.py",
+                "description": "Focused test evidence.",
+                "metadata": {},
+            }
+        ],
         "blocker": None,
     }

@@ -112,6 +112,8 @@ class FakeStore:
         self.heartbeat_calls = 0
         self.recovery_started: Optional[Event] = None
         self.recovery_release: Optional[Event] = None
+        self.focused_test_preparations: list[Dict[str, Any]] = []
+        self.focused_test_completions: list[Dict[str, Any]] = []
 
     def recover_expired_leases(self) -> Iterable[str]:
         if self.recovery_started is not None:
@@ -180,6 +182,32 @@ class FakeStore:
             and job.lease_owner == worker_id
             and job.lease_token == lease_token
         )
+
+    def prepare_focused_test_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        job = self.jobs[job_id]
+        if job.lease_owner != worker_id or job.lease_token != lease_token:
+            return None
+        prepared = {
+            "id": "focused-execution",
+            "command": ["/usr/bin/true"],
+        }
+        self.focused_test_preparations.append(dict(prepared))
+        return prepared
+
+    def complete_focused_test_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        job = self.jobs[job_id]
+        if job.lease_owner != worker_id or job.lease_token != lease_token:
+            return None
+        self.focused_test_completions.append(dict(result))
+        return {"canonical_handoff": _passing_test(job.item_id).model_dump(mode="json")}
 
     def commit_stage_result(
         self,
@@ -902,5 +930,46 @@ def test_default_scheduler_rejects_nonexistent_evidence_attachment() -> None:
         assert store.commits == []
         assert store.items[item.id].state == ItemState.BLOCKED
         assert "evidence attachment does not exist" in store.failures[0]["error"]
+
+    asyncio.run(scenario())
+
+
+def test_focused_test_callbacks_remain_bound_to_the_claim_fence() -> None:
+    class CallbackTester:
+        role = WorkerRole.TESTER
+
+        async def run(self, context: WorkerContext) -> WorkerOutput:
+            prepared = context.prepare_focused_test_execution()
+            assert prepared == {
+                "id": "focused-execution",
+                "command": ["/usr/bin/true"],
+            }
+            completed = context.complete_focused_test_execution(
+                {"execution_id": prepared["id"], "exit_code": 0}
+            )
+            return completed["canonical_handoff"]
+
+    async def scenario() -> None:
+        campaign = _campaign()
+        item = _item(campaign, "focused-callbacks", ItemState.READY_FOR_TEST)
+        job = _job(campaign, item, WorkerRole.TESTER)
+        store = FakeStore(campaign, (item,), (job,))
+        scheduler = Scheduler(
+            store,
+            {WorkerRole.TESTER: (CallbackTester(),)},
+            global_concurrency_limit=1,
+            allow_simulated_evidence=True,
+        )
+
+        await scheduler.run_until_quiescent()
+
+        assert scheduler.errors == []
+        assert store.items[item.id].state == ItemState.VERIFIED_GREEN
+        assert store.focused_test_preparations == [
+            {"id": "focused-execution", "command": ["/usr/bin/true"]}
+        ]
+        assert store.focused_test_completions == [
+            {"execution_id": "focused-execution", "exit_code": 0}
+        ]
 
     asyncio.run(scenario())

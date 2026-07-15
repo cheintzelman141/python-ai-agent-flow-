@@ -353,6 +353,33 @@ class SQLiteSchedulerStorage:
             return False
         return True
 
+    def prepare_focused_test_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.prepare_focused_test_execution(
+                job_id, worker_id, lease_token
+            )
+        except LeaseConflict:
+            return None
+
+    def complete_focused_test_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.complete_focused_test_execution(
+                job_id,
+                worker_id,
+                lease_token,
+                dict(result),
+            )
+        except LeaseConflict:
+            return None
+
     def commit_stage_result(
         self,
         *,

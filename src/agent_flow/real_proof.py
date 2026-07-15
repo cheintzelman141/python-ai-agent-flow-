@@ -14,7 +14,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import subprocess
 import sys
@@ -28,6 +27,7 @@ from agent_flow.codex_worker import (
     CodexCliWorker,
     codex_handoff_schema,
 )
+from agent_flow.focused_tests import FocusedTestWorker
 from agent_flow.models import (
     FixHandoff,
     InvestigationHandoff,
@@ -47,12 +47,14 @@ from agent_flow.storage import SQLiteStore
 from agent_flow.workers import Worker
 from agent_flow.worktrees import (
     GitInspector,
+    GuardedGitCommandRunner,
     ManagedWorktreeConfig,
     ManagedWorktreeManager,
 )
 
 
-FOCUSED_TEST_ARGUMENTS = ("-B", "-m", "unittest", "-v")
+FOCUSED_TEST_FILE = "test_calculator.py"
+FOCUSED_TEST_SELECTOR = "CalculatorTests.test_adds_two_numbers"
 PROVIDER_ARTIFACT_KINDS = {
     "codex_schema",
     "codex_jsonl",
@@ -111,8 +113,8 @@ class RealProofRunner:
         self.worktree_root = self.root / "worktrees"
         self.lifecycle_runtime = self.root / "lifecycle-runtime"
         self.codex_runtime = self.root / "codex-runtime"
+        self.focused_test_runtime = self.root / "focused-test-runtime"
         self.report_path = self.root / "proof-report.json"
-        self.focused_test_log = self.root / "supervisor-focused-test.log"
         self.worker_factory = worker_factory or self._codex_worker
         self.require_authenticated_provider = require_authenticated_provider
         self.inspector = GitInspector.controlled()
@@ -179,34 +181,39 @@ class RealProofRunner:
         )
         (self.source / "test_calculator.py").write_text(
             "from pathlib import Path\n"
+            "import importlib.util\n"
             "import unittest\n\n"
-            "from calculator import add\n\n\n"
+            "calculator_file = Path(__file__).with_name('calculator.py').resolve()\n"
+            "calculator_spec = importlib.util.spec_from_file_location(\n"
+            "    'agent_flow_fixture_calculator', calculator_file\n"
+            ")\n"
+            "if calculator_spec is None or calculator_spec.loader is None:\n"
+            "    raise RuntimeError('calculator fixture cannot be loaded')\n"
+            "calculator = importlib.util.module_from_spec(calculator_spec)\n"
+            "calculator_spec.loader.exec_module(calculator)\n\n\n"
             "class CalculatorTests(unittest.TestCase):\n"
             "    def test_adds_two_numbers(self) -> None:\n"
             "        test_file = Path(__file__).resolve()\n"
             "        print('AGENT_FLOW_TEST_FILE=%s' % test_file)\n"
             "        self.assertEqual(Path.cwd().resolve(), test_file.parent)\n"
-            "        self.assertEqual(add(2, 3), 5)\n\n\n"
+            "        self.assertEqual(calculator.add(2, 3), 5)\n\n\n"
             "if __name__ == '__main__':\n"
             "    unittest.main()\n",
             encoding="utf-8",
         )
-        focused_command = self._focused_command_text
         (self.source / "AGENTS.md").write_text(
             "# Disposable Agent Flow proof fixture\n\n"
             "This repository exists only for the bounded Agent Flow proof.\n\n"
-            "- Investigator: run `%s` as a standalone command, identify the "
+            "- Investigator: inspect the focused unittest, identify the "
             "arithmetic defect, and cite the absolute tracked "
             "`test_calculator.py` path as test evidence.\n"
             "- Fixer: change only `calculator.py` so `add(2, 3)` returns `5`; "
-            "run `%s` as a standalone command; do not commit; cite the absolute "
+            "do not run tests or commit; cite the absolute "
             "tracked `test_calculator.py` path as evidence.\n"
-            "- Tester: run `%s` as a standalone command with no chaining or "
-            "shell compound; return one passing "
-            "`focused_tests` gate proof citing the absolute tracked test file.\n"
+            "- Testing is owned by Agent Flow's deterministic focused-test "
+            "collector; no model may supply or alter its command.\n"
             "- Do not create files, use the network, change Git state, or touch "
-            "any other path.\n"
-            % (focused_command, focused_command, focused_command),
+            "any other path.\n",
             encoding="utf-8",
         )
         self._git("add", "AGENTS.md", "calculator.py", "test_calculator.py")
@@ -264,12 +271,11 @@ class RealProofRunner:
                 campaign["id"],
                 "Repair the disposable calculator addition defect",
                 description=(
-                    "Run %s as a standalone command. Investigate the failing "
-                    "add(2, 3) behavior, change only calculator.py from "
-                    "subtraction to addition, and prove the focused unittest "
-                    "passes. Use the absolute tracked test_calculator.py file "
-                    "as evidence; do not create evidence files."
-                    % self._focused_command_text
+                    "Investigate the failing add(2, 3) behavior and change only "
+                    "calculator.py from subtraction to addition. Agent Flow "
+                    "will run its immutable focused-test plan. Use the absolute "
+                    "tracked test_calculator.py file as evidence; do not create "
+                    "evidence files."
                 ),
                 required_gates=["focused_tests"],
                 initial_job={
@@ -323,24 +329,61 @@ class RealProofRunner:
             worktree = manager.provision(
                 campaign["id"], item["id"], self.source, "HEAD"
             )
-            worker_scheduler = await self._run_scheduler(
+            report["campaign_id"] = campaign["id"]
+            report["item_id"] = item["id"]
+            report["worktree_id"] = worktree["id"]
+            report["worktree_path"] = worktree["worktree_path"]
+            report["managed_worktree"] = worktree
+            fixer_scheduler = await self._run_scheduler(
                 store,
                 {
                     WorkerRole.FIXER: (
                         self.worker_factory(WorkerRole.FIXER, config),
                     ),
-                    WorkerRole.TESTER: (
-                        self.worker_factory(WorkerRole.TESTER, config),
-                    ),
                 },
             )
-            report["worker_scheduler_errors"] = [
-                repr(error) for error in worker_scheduler.errors
+            report["fixer_scheduler_errors"] = [
+                repr(error) for error in fixer_scheduler.errors
             ]
-            report["campaign_id"] = campaign["id"]
-            report["item_id"] = item["id"]
-            report["worktree_id"] = worktree["id"]
-            report["worktree_path"] = worktree["worktree_path"]
+            if store.get_work_item(item["id"])["state"] != "ready_for_test":
+                self._capture_store(report, store, campaign["id"], item["id"])
+                raise RealProofError("fixer did not reach ready_for_test")
+            worktree_path = Path(str(worktree["worktree_path"]))
+            if not self._exact_worktree_diff(worktree_path, report):
+                self._capture_store(report, store, campaign["id"], item["id"])
+                raise RealProofError(
+                    "fixer output did not match the exact disposable diff"
+                )
+            plan = store.create_focused_test_plan(
+                item["id"],
+                executable_path=str(self.python_executable),
+                test_file=FOCUSED_TEST_FILE,
+                selector=FOCUSED_TEST_SELECTOR,
+                workspace_manifest=self._workspace_manifest(worktree_path),
+                runtime_root=str(self.focused_test_runtime),
+                timeout_seconds=60.0,
+                output_limit_bytes=1024 * 1024,
+            )
+            report["focused_test_plan_id"] = plan["id"]
+            focused_worker = FocusedTestWorker(
+                GuardedGitCommandRunner(
+                    runtime=local_process_runtime(),
+                    timeout_seconds=60.0,
+                    terminate_grace_seconds=5.0,
+                    max_output_bytes=1024 * 1024,
+                )
+            )
+            tester_scheduler = await self._run_scheduler(
+                store,
+                {WorkerRole.TESTER: (focused_worker,)},
+            )
+            report["tester_scheduler_errors"] = [
+                repr(error) for error in tester_scheduler.errors
+            ]
+            report["worker_scheduler_errors"] = (
+                report["fixer_scheduler_errors"]
+                + report["tester_scheduler_errors"]
+            )
             self._capture_store(report, store, campaign["id"], item["id"])
 
     async def _run_scheduler(
@@ -371,7 +414,14 @@ class RealProofRunner:
         report["final_item_state"] = store.get_work_item(item_id)["state"]
         report["jobs"] = store.list_jobs(work_item_id=item_id)
         report["attempts"] = store.list_attempts(campaign_id=campaign_id)
+        report["external_processes"] = store.list_external_processes()
         report["artifacts"] = store.list_artifacts(item_id)
+        report["focused_test_plans"] = store.list_focused_test_plans(
+            work_item_id=item_id
+        )
+        report["focused_test_executions"] = (
+            store.list_focused_test_executions(work_item_id=item_id)
+        )
         report["events"] = store.list_events(work_item_id=item_id)
         report["resource_leases"] = store.list_resource_leases(
             campaign_id=campaign_id
@@ -390,18 +440,6 @@ class RealProofRunner:
         worktree_path = Path(str(report.get("worktree_path") or ""))
         if not worktree_path.is_dir():
             raise RealProofError("managed proof worktree is absent")
-        test = self._run(
-            self.focused_test_command, cwd=worktree_path, check=False
-        )
-        self.focused_test_log.write_text(
-            test.stdout + test.stderr, encoding="utf-8"
-        )
-        report["supervisor_focused_test"] = {
-            "command": list(self.focused_test_command),
-            "return_code": test.returncode,
-            "log": str(self.focused_test_log),
-            "log_sha256": self._sha256(self.focused_test_log),
-        }
         report["exact_worktree_diff"] = self._exact_worktree_diff(
             worktree_path, report
         )
@@ -423,18 +461,33 @@ class RealProofRunner:
             self._sessions_distinct(attempts)
         )
         report["all_processes_stopped"] = self._all_processes_stopped(
-            attempts, report
+            jobs,
+            attempts,
+            list(report.get("external_processes") or []),
+            report,
         )
         report["session_events_precede_completion"] = (
             self._session_events_precede_completion(
-                jobs, attempts, events
+                jobs,
+                attempts,
+                list(report.get("external_processes") or []),
+                events,
             )
         )
         report["artifact_events_valid"] = self._artifact_events_valid(
             jobs, artifacts, events
         )
-        report["tester_command_proof"] = self._tester_command_proof(
-            jobs, artifacts, worktree_path
+        report["focused_test_execution_proof"] = (
+            self._focused_test_execution_proof(
+                list(report.get("focused_test_plans") or []),
+                list(report.get("focused_test_executions") or []),
+                jobs,
+                attempts,
+                artifacts,
+                events,
+                worktree_path,
+                report,
+            )
         )
         report["executable_hashes_unchanged"] = (
             self._executable_hashes_unchanged(report)
@@ -445,7 +498,7 @@ class RealProofRunner:
             report["all_processes_stopped"],
             report["session_events_precede_completion"],
             report["artifact_events_valid"],
-            report["tester_command_proof"],
+            report["focused_test_execution_proof"],
             report["executable_hashes_unchanged"],
         )
         report["provider_checks_skipped"] = (
@@ -455,7 +508,7 @@ class RealProofRunner:
             report.get("investigator_scheduler_errors")
             or report.get("worker_scheduler_errors")
         )
-        required = self._core_requirements(report, test.returncode)
+        required = self._core_requirements(report)
         if self.require_authenticated_provider:
             required += provider_checks
         report["verified"] = all(required)
@@ -688,8 +741,15 @@ class RealProofRunner:
         report: Mapping[str, Any],
     ) -> bool:
         job_by_id = {str(job.get("id")): job for job in jobs}
+        codex_job_ids = {
+            str(job.get("id"))
+            for job in jobs
+            if str(job.get("role")) in ("investigator", "fixer")
+        }
         attempt_by_id = {
-            str(attempt.get("id")): attempt for attempt in attempts
+            str(attempt.get("id")): attempt
+            for attempt in attempts
+            if str(attempt.get("job_id")) in codex_job_ids
         }
         expected_attempts = set(attempt_by_id)
         kinds_by_attempt: Dict[str, set] = {
@@ -706,7 +766,11 @@ class RealProofRunner:
         }
         jsonl_by_attempt: Dict[str, Path] = {}
         jsonl_payload_by_attempt: Dict[str, Mapping[str, Any]] = {}
-        for artifact in artifacts:
+        for artifact in (
+            row
+            for row in artifacts
+            if str(row.get("kind")) in PROVIDER_ARTIFACT_KINDS
+        ):
             path = Path(str(artifact.get("uri") or ""))
             metadata = artifact.get("metadata") or {}
             attempt_id = str(metadata.get("attempt_id") or "")
@@ -717,7 +781,6 @@ class RealProofRunner:
             expected_sandbox = {
                 "investigator": "read-only",
                 "fixer": "workspace-write",
-                "tester": "read-only",
             }.get(str(job.get("role")))
             expected_directory = self._attempt_runtime_directory(
                 str(report.get("campaign_id") or ""),
@@ -821,53 +884,92 @@ class RealProofRunner:
 
     @staticmethod
     def _sessions_distinct(attempts: Sequence[Mapping[str, Any]]) -> bool:
-        sessions = [attempt.get("external_session_id") for attempt in attempts]
-        return len(sessions) == 3 and all(sessions) and len(set(sessions)) == 3
+        sessions = [
+            attempt.get("external_session_id")
+            for attempt in attempts
+            if attempt.get("external_session_id") is not None
+        ]
+        return (
+            len(attempts) == 3
+            and len(sessions) == 2
+            and all(sessions)
+            and len(set(sessions)) == 2
+            and sum(
+                attempt.get("external_session_id") is None
+                for attempt in attempts
+            ) == 1
+        )
 
     def _all_processes_stopped(
         self,
+        jobs: Sequence[Mapping[str, Any]],
         attempts: Sequence[Mapping[str, Any]],
+        processes: Sequence[Mapping[str, Any]],
         report: Mapping[str, Any],
     ) -> bool:
         codex = report.get("codex_executable") or {}
         guardian = report.get("guardian_executable") or {}
-        expected_target = codex.get("path")
         expected_guardian = guardian.get("path")
-        if len(attempts) != 3 or not all(
+        jobs_by_id = {str(job.get("id")): job for job in jobs}
+        attempts_by_id = {
+            str(attempt.get("id")): attempt for attempt in attempts
+        }
+        expected_target_by_provider = {
+            "codex": codex.get("path"),
+            "focused_test": (report.get("python_executable") or {}).get("path"),
+        }
+        if (
+            len(attempts) != 3
+            or len(processes) != 3
+            or not all(
             attempt.get("status") == "succeeded"
             and attempt.get("error") is None
             and attempt.get("finished_at") is not None
-            and attempt.get("external_process_id") is not None
-            and int(attempt.get("external_process_id")) > 1
-            and attempt.get("external_process_group_id")
-            == attempt.get("external_process_id")
-            and attempt.get("external_provider") == "codex"
-            and attempt.get("external_process_identity_version")
-            == "darwin_libproc_v1"
-            and attempt.get("external_process_owner_uid") == os.getuid()
-            and int(attempt.get("external_process_start_seconds") or 0) > 0
-            and 0
-            <= int(attempt.get("external_process_start_microseconds") or -1)
-            < 1_000_000
-            and attempt.get("external_process_executable")
-            == expected_guardian
-            and self._existing_absolute_file(expected_guardian)
-            and attempt.get("external_process_target_executable")
-            == expected_target
-            and attempt.get("external_process_state") == "stopped"
-            and attempt.get("external_process_outcome") == "reaped"
-            and attempt.get("external_process_stopped_at") is not None
-            and attempt.get("external_process_last_error") is None
             for attempt in attempts
+            )
+            or not all(
+                process.get("attempt_id") in attempts_by_id
+                and int(process.get("process_id") or 0) > 1
+                and process.get("process_group_id") == process.get("process_id")
+                and process.get("provider") in expected_target_by_provider
+                and process.get("identity_version") == "darwin_libproc_v1"
+                and process.get("owner_uid") == os.getuid()
+                and int(process.get("start_seconds") or 0) > 0
+                and 0 <= int(process.get("start_microseconds") or -1) < 1_000_000
+                and process.get("kernel_executable") == expected_guardian
+                and self._existing_absolute_file(expected_guardian)
+                and process.get("target_executable")
+                == expected_target_by_provider.get(str(process.get("provider")))
+                and process.get("state") == "stopped"
+                and process.get("outcome") == "reaped"
+                and process.get("stopped_at") is not None
+                and process.get("last_error") is None
+                for process in processes
+            )
         ):
+            return False
+        providers_by_role = {
+            str(
+                jobs_by_id.get(
+                    str(attempts_by_id[str(process.get("attempt_id"))].get("job_id")),
+                    {},
+                ).get("role")
+            ): process.get("provider")
+            for process in processes
+        }
+        if providers_by_role != {
+            "investigator": "codex",
+            "fixer": "codex",
+            "tester": "focused_test",
+        }:
             return False
         identities = {
             (
-                attempt.get("external_process_id"),
-                attempt.get("external_process_start_seconds"),
-                attempt.get("external_process_start_microseconds"),
+                process.get("process_id"),
+                process.get("start_seconds"),
+                process.get("start_microseconds"),
             )
-            for attempt in attempts
+            for process in processes
         }
         return len(identities) == 3
 
@@ -875,6 +977,7 @@ class RealProofRunner:
     def _session_events_precede_completion(
         jobs: Sequence[Mapping[str, Any]],
         attempts: Sequence[Mapping[str, Any]],
+        processes: Sequence[Mapping[str, Any]],
         events: Sequence[Mapping[str, Any]],
     ) -> bool:
         attempts_by_job: Dict[str, list] = {}
@@ -889,6 +992,14 @@ class RealProofRunner:
             if len(bound_attempts) != 1:
                 return False
             attempt = bound_attempts[0]
+            bound_processes = [
+                process
+                for process in processes
+                if process.get("attempt_id") == attempt.get("id")
+            ]
+            if len(bound_processes) != 1:
+                return False
+            process = bound_processes[0]
             by_type: Dict[str, list] = {}
             for event in events:
                 if event.get("job_id") == job_id:
@@ -907,18 +1018,18 @@ class RealProofRunner:
             completion_events = by_type.get(
                 str(_COMPLETION_EVENT_BY_ROLE.get(role)), []
             )
+            session_required = process.get("provider") == "codex"
             if not (
                 len(started_events) == 1
-                and len(session_events) == 1
+                and len(session_events) == (1 if session_required else 0)
                 and len(stopped_events) == 1
                 and len(completion_events) == 1
             ):
                 return False
             started_data = started_events[0].get("event_data") or {}
-            session_data = session_events[0].get("event_data") or {}
             stopped_data = stopped_events[0].get("event_data") or {}
             if started_data != {
-                "provider": attempt.get("external_provider"),
+                "provider": process.get("provider"),
                 "process_id": attempt.get("external_process_id"),
                 "process_group_id": attempt.get(
                     "external_process_group_id"
@@ -938,8 +1049,10 @@ class RealProofRunner:
                 ),
             }:
                 return False
-            if session_data != {
-                "provider": attempt.get("external_provider"),
+            if session_required and (
+                session_events[0].get("event_data") or {}
+            ) != {
+                "provider": process.get("provider"),
                 "session_id": attempt.get("external_session_id"),
             }:
                 return False
@@ -950,83 +1063,247 @@ class RealProofRunner:
                 ),
             }:
                 return False
-            sequences = (
-                int(started_events[0]["sequence"]),
-                int(session_events[0]["sequence"]),
-                int(stopped_events[0]["sequence"]),
-                int(completion_events[0]["sequence"]),
+            sequences = [int(started_events[0]["sequence"])]
+            if session_required:
+                sequences.append(int(session_events[0]["sequence"]))
+            sequences.extend(
+                (
+                    int(stopped_events[0]["sequence"]),
+                    int(completion_events[0]["sequence"]),
+                )
             )
-            if not (
-                sequences[0]
-                < sequences[1]
-                < sequences[2]
-                < sequences[3]
-            ):
+            if sequences != sorted(set(sequences)):
                 return False
         return bool(jobs)
 
-    def _tester_command_proof(
+    def _focused_test_execution_proof(
         self,
+        plans: Sequence[Mapping[str, Any]],
+        executions: Sequence[Mapping[str, Any]],
         jobs: Sequence[Mapping[str, Any]],
+        attempts: Sequence[Mapping[str, Any]],
         artifacts: Sequence[Mapping[str, Any]],
+        events: Sequence[Mapping[str, Any]],
         worktree_path: Path,
+        report: Mapping[str, Any],
     ) -> bool:
-        tester = next(
-            (job for job in jobs if job.get("role") == "tester"), None
-        )
-        if tester is None:
+        testers = [job for job in jobs if job.get("role") == "tester"]
+        if len(testers) != 1 or len(plans) != 1 or len(executions) != 1:
             return False
-        jsonl = next(
-            (
-                Path(str(artifact["uri"]))
-                for artifact in artifacts
-                if artifact.get("job_id") == tester.get("id")
-                and artifact.get("kind") == "codex_jsonl"
-            ),
-            None,
-        )
-        if jsonl is None or not jsonl.is_file():
+        tester = testers[0]
+        tester_attempts = [
+            attempt
+            for attempt in attempts
+            if attempt.get("job_id") == tester.get("id")
+        ]
+        if len(tester_attempts) != 1:
             return False
-        exact_command = self._focused_command_text
-        expected_test_marker = "AGENT_FLOW_TEST_FILE=%s" % (
-            worktree_path / "test_calculator.py"
+        attempt = tester_attempts[0]
+        plan = plans[0]
+        execution = executions[0]
+        expected_manifest = self._workspace_manifest(worktree_path)
+        expected_command = [
+            str(self.python_executable),
+            "-I",
+            "-B",
+            str(worktree_path / FOCUSED_TEST_FILE),
+            FOCUSED_TEST_SELECTOR,
+            "-v",
+        ]
+        command = execution.get("command_argv", execution.get("command"))
+        if (
+            plan.get("id") != report.get("focused_test_plan_id")
+            or plan.get("work_item_id") != report.get("item_id")
+            or plan.get("executable_path") != str(self.python_executable)
+            or plan.get("test_file") != FOCUSED_TEST_FILE
+            or plan.get("selector") != FOCUSED_TEST_SELECTOR
+            or plan.get("workspace_manifest") != expected_manifest
+            or execution.get("plan_id") != plan.get("id")
+            or execution.get("attempt_id") != attempt.get("id")
+            or execution.get("job_id") != tester.get("id")
+            or execution.get("work_item_id") != report.get("item_id")
+            or execution.get("managed_worktree_id")
+            != report.get("worktree_id")
+            or execution.get("managed_worktree_generation") != 1
+            or command != expected_command
+            or execution.get("cwd") != str(worktree_path)
+            or execution.get("status") != "finished"
+            or execution.get("exit_code") != 0
+            or execution.get("outcome") != "pass"
+            or execution.get("semantic_summary")
+            != "exactly one persisted focused unittest selector passed"
+            or execution.get("stdout_truncated") not in (False, 0)
+            or execution.get("stderr_truncated") not in (False, 0)
+            or execution.get("workspace_manifest_before") != expected_manifest
+            or execution.get("workspace_manifest_after") != expected_manifest
+            or attempt.get("external_session_id") is not None
+        ):
+            return False
+
+        focused_artifacts = [
+            artifact
+            for artifact in artifacts
+            if artifact.get("job_id") == tester.get("id")
+        ]
+        if {
+            str(artifact.get("kind")) for artifact in focused_artifacts
+        } != {"focused_test_stdout", "focused_test_stderr"}:
+            return False
+        output_by_kind: Dict[str, str] = {}
+        for artifact in focused_artifacts:
+            kind = str(artifact.get("kind"))
+            metadata = artifact.get("metadata") or {}
+            path = Path(str(artifact.get("uri") or ""))
+            prefix = "stdout" if kind.endswith("stdout") else "stderr"
+            try:
+                file_metadata = path.lstat()
+            except OSError:
+                return False
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or file_metadata.st_uid != os.getuid()
+                or file_metadata.st_nlink != 1
+                or file_metadata.st_mode & 0o077
+                or not self._is_within(path.resolve(), self.focused_test_runtime)
+                or self._is_within(path.resolve(), self.source)
+                or self._is_within(path.resolve(), worktree_path)
+                or metadata.get("attempt_id") != attempt.get("id")
+                or metadata.get("execution_id") != execution.get("id")
+                or metadata.get("sha256") != self._sha256(path)
+                or metadata.get("bytes") != file_metadata.st_size
+                or execution.get(prefix + "_path") != str(path.resolve())
+                or execution.get(prefix + "_sha256") != self._sha256(path)
+                or execution.get(prefix + "_bytes") != file_metadata.st_size
+            ):
+                return False
+            try:
+                output_by_kind[prefix] = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+        combined_output = output_by_kind.get("stdout", "") + output_by_kind.get(
+            "stderr", ""
         )
-        found = False
-        for line in jsonl.read_text(encoding="utf-8").splitlines():
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                return False
-            item = event.get("item") or {}
-            command = str(item.get("command") or "")
-            try:
-                command_parts = shlex.split(command)
-            except ValueError:
-                return False
-            exact_execution = command_parts == list(self.focused_test_command)
-            if (
-                len(command_parts) == 3
-                and command_parts[0] in ("/bin/zsh", "/bin/bash", "/bin/sh")
-                and command_parts[1] == "-lc"
-                and command_parts[2] == exact_command
-            ):
-                exact_execution = True
-            output = str(item.get("aggregated_output") or "")
-            if (
-                event.get("type") == "item.completed"
-                and item.get("type") == "command_execution"
-                and exact_execution
-                and item.get("status") == "completed"
-                and item.get("exit_code") == 0
-                and "test_adds_two_numbers" in output
-                and expected_test_marker in output
-                and "Ran 1 test" in output
-                and "OK" in output
-                and "FAILED" not in output
-                and "ERROR" not in output
-            ):
-                found = True
-        return found
+        expected_marker = "AGENT_FLOW_TEST_FILE=%s" % (
+            worktree_path / FOCUSED_TEST_FILE
+        )
+        if not (
+            "test_adds_two_numbers" in combined_output
+            and expected_marker in combined_output
+            and "Ran 1 test" in combined_output
+            and "OK" in combined_output
+            and "FAILED" not in combined_output
+            and "ERROR" not in combined_output
+        ):
+            return False
+
+        artifact_by_kind = {
+            str(artifact.get("kind")): artifact
+            for artifact in focused_artifacts
+        }
+        summary = str(execution.get("semantic_summary"))
+        expected_handoff = {
+            "schema_version": 1,
+            "item_id": report.get("item_id"),
+            "outcome": "pass",
+            "summary": summary,
+            "gate_proofs": [
+                {
+                    "gate": "focused_tests",
+                    "result": "pass",
+                    "summary": summary,
+                    "evidence": [
+                        {
+                            "id": artifact_by_kind["focused_test_stdout"].get("id"),
+                            "kind": "test",
+                            "location": artifact_by_kind["focused_test_stdout"].get("uri"),
+                            "description": (
+                                "Authoritative bounded stdout for the focused "
+                                "unittest run."
+                            ),
+                            "metadata": artifact_by_kind[
+                                "focused_test_stdout"
+                            ].get("metadata"),
+                        },
+                        {
+                            "id": artifact_by_kind["focused_test_stderr"].get("id"),
+                            "kind": "log",
+                            "location": artifact_by_kind["focused_test_stderr"].get("uri"),
+                            "description": (
+                                "Authoritative bounded stderr for the focused "
+                                "unittest run."
+                            ),
+                            "metadata": artifact_by_kind[
+                                "focused_test_stderr"
+                            ].get("metadata"),
+                        },
+                    ],
+                }
+            ],
+            "failure_summary": None,
+            "blocker": None,
+        }
+        if (
+            attempt.get("result") != expected_handoff
+            or execution.get("canonical_handoff") != expected_handoff
+        ):
+            return False
+
+        plan_events = [
+            event
+            for event in events
+            if event.get("event_type") == "focused_test.plan_created"
+        ]
+        prepared_events = [
+            event
+            for event in events
+            if event.get("event_type") == "focused_test.execution_prepared"
+        ]
+        finished_events = [
+            event
+            for event in events
+            if event.get("event_type") == "focused_test.execution_finished"
+        ]
+        tester_started = [
+            event
+            for event in events
+            if event.get("job_id") == tester.get("id")
+            and event.get("event_type") == "worker.external_process_started"
+        ]
+        tester_stopped = [
+            event
+            for event in events
+            if event.get("job_id") == tester.get("id")
+            and event.get("event_type") == "worker.external_process_stopped"
+        ]
+        tester_completed = [
+            event
+            for event in events
+            if event.get("job_id") == tester.get("id")
+            and event.get("event_type") == "test_verified_green"
+        ]
+        if not (
+            len(plan_events) == 1
+            and len(prepared_events) == 1
+            and len(finished_events) == 1
+            and len(tester_started) == 1
+            and len(tester_stopped) == 1
+            and len(tester_completed) == 1
+            and (plan_events[0].get("event_data") or {}).get("plan_id")
+            == plan.get("id")
+            and (prepared_events[0].get("event_data") or {}).get("execution_id")
+            == execution.get("id")
+            and (finished_events[0].get("event_data") or {}).get("execution_id")
+            == execution.get("id")
+            and int(plan_events[0]["sequence"])
+            < int(prepared_events[0]["sequence"])
+            < int(tester_started[0]["sequence"])
+            < int(tester_stopped[0]["sequence"])
+            < int(finished_events[0]["sequence"])
+            < int(tester_completed[0]["sequence"])
+        ):
+            return False
+        return True
 
     @staticmethod
     def _artifact_events_valid(
@@ -1034,8 +1311,17 @@ class RealProofRunner:
         artifacts: Sequence[Mapping[str, Any]],
         events: Sequence[Mapping[str, Any]],
     ) -> bool:
+        expected_kinds_by_role = {
+            "investigator": PROVIDER_ARTIFACT_KINDS,
+            "fixer": PROVIDER_ARTIFACT_KINDS,
+            "tester": {"focused_test_stdout", "focused_test_stderr"},
+        }
         for job in jobs:
             job_id = str(job.get("id"))
+            role = str(job.get("role"))
+            expected_kinds = expected_kinds_by_role.get(role)
+            if expected_kinds is None:
+                return False
             job_artifacts = [
                 artifact
                 for artifact in artifacts
@@ -1080,20 +1366,50 @@ class RealProofRunner:
                 for event in artifact_events
             }
             if (
-                len(job_artifacts) != len(PROVIDER_ARTIFACT_KINDS)
-                or len(expected) != len(PROVIDER_ARTIFACT_KINDS)
-                or len(artifact_events) != len(PROVIDER_ARTIFACT_KINDS)
+                {str(artifact.get("kind")) for artifact in job_artifacts}
+                != expected_kinds
+                or len(job_artifacts) != len(expected_kinds)
+                or len(expected) != len(expected_kinds)
+                or len(artifact_events) != len(expected_kinds)
                 or observed != expected
-                or len(session_events) != 1
                 or len(stopped_events) != 1
-                or not all(
-                    int(session_events[0]["sequence"])
-                    < int(event["sequence"])
-                    < int(stopped_events[0]["sequence"])
-                    for event in artifact_events
-                )
             ):
                 return False
+            if role in ("investigator", "fixer"):
+                if len(session_events) != 1 or not all(
+                        int(session_events[0]["sequence"])
+                        < int(event["sequence"])
+                        < int(stopped_events[0]["sequence"])
+                        for event in artifact_events
+                    ):
+                    return False
+            else:
+                prepared = [
+                    event
+                    for event in events
+                    if str(event.get("job_id")) == job_id
+                    and event.get("event_type")
+                    == "focused_test.execution_prepared"
+                ]
+                finished = [
+                    event
+                    for event in events
+                    if str(event.get("job_id")) == job_id
+                    and event.get("event_type")
+                    == "focused_test.execution_finished"
+                ]
+                if (
+                    session_events
+                    or len(prepared) != 1
+                    or len(finished) != 1
+                    or not all(
+                        int(stopped_events[0]["sequence"])
+                        < int(event["sequence"])
+                        < int(finished[0]["sequence"])
+                        for event in artifact_events
+                    )
+                ):
+                    return False
         return bool(jobs)
 
     def _source_snapshot(self) -> Mapping[str, Any]:
@@ -1104,6 +1420,31 @@ class RealProofRunner:
                 files[relative] = self._sha256(self.source / relative)
         snapshot["tracked_file_hashes"] = files
         return snapshot
+
+    def _workspace_manifest(
+        self, worktree_path: Path
+    ) -> Mapping[str, Mapping[str, Any]]:
+        expected = {"AGENTS.md", "calculator.py", FOCUSED_TEST_FILE}
+        observed = {
+            entry.name for entry in worktree_path.iterdir() if entry.name != ".git"
+        }
+        if observed != expected:
+            raise RealProofError(
+                "focused-test workspace does not contain the exact fixed fixture"
+            )
+        manifest: Dict[str, Mapping[str, Any]] = {}
+        for relative in sorted(expected):
+            path = worktree_path / relative
+            metadata = path.lstat()
+            if path.is_symlink() or not path.is_file():
+                raise RealProofError(
+                    "focused-test workspace contains a non-regular fixture file"
+                )
+            manifest[relative] = {
+                "sha256": self._sha256(path),
+                "mode": metadata.st_mode,
+            }
+        return manifest
 
     def _git(self, *arguments: str, cwd: Optional[Path] = None) -> str:
         command = (
@@ -1168,14 +1509,6 @@ class RealProofRunner:
         except ValueError:
             return False
         return True
-
-    @property
-    def focused_test_command(self) -> Tuple[str, ...]:
-        return (str(self.python_executable),) + FOCUSED_TEST_ARGUMENTS
-
-    @property
-    def _focused_command_text(self) -> str:
-        return shlex.join(self.focused_test_command)
 
     def _executable_record(self, path: Path) -> Mapping[str, Any]:
         resolved = path.resolve()
@@ -1298,7 +1631,7 @@ class RealProofRunner:
 
     @staticmethod
     def _core_requirements(
-        report: Mapping[str, Any], test_return_code: int
+        report: Mapping[str, Any]
     ) -> Tuple[bool, ...]:
         return (
             report.get("final_item_state") == "verified_green",
@@ -1308,7 +1641,7 @@ class RealProofRunner:
             report.get("attempts_succeeded_exactly_once") is True,
             report.get("same_worktree_fixer_tester") is True,
             report.get("scheduler_error_free") is True,
-            test_return_code == 0,
+            report.get("focused_test_execution_proof") is True,
             not report.get("resource_leases"),
             report.get("foreign_key_violations") == [],
         )

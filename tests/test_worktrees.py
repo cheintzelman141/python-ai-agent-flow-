@@ -76,7 +76,13 @@ def _pending_fixer(
 ) -> tuple[dict, dict, dict]:
     campaign = store.create_campaign(
         "real managed worktree",
-        config={"repository_paths": [str(repository)]},
+        config={
+            "repository_paths": [str(repository)],
+            # These tests exercise lifecycle cleanup, not the Phase 2
+            # authoritative test collector. Keep their synthetic terminal
+            # transition explicit while preserving a real managed worktree.
+            "allow_simulated_evidence": True,
+        },
     )
     item = store.create_work_item(
         campaign["id"],
@@ -89,6 +95,7 @@ def _pending_fixer(
             "stage": "fix",
             "active_item_state": "fixing",
             "required_approval_action": "local_code_changes",
+            "workspace_kind": "managed_worktree",
         },
     )
     approval = store.create_approval(

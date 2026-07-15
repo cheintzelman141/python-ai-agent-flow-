@@ -10,13 +10,15 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import sqlite3
+import stat
 import threading
 import time
 import uuid
 from contextlib import contextmanager
 from enum import Enum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from pydantic import ValidationError
@@ -35,7 +37,7 @@ from agent_flow.models import (
 )
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 OPEN_JOB_STATUSES = ("pending", "running")
 DEFAULT_REQUIRED_GATES = ("focused_tests", "browser", "database")
 DEFAULT_ROLE_LIMITS = {"investigator": 2, "fixer": 2, "tester": 2}
@@ -147,6 +149,19 @@ def _handoff_evidence(handoff: Any) -> Iterator[EvidenceRef]:
         yield from proof.evidence
 
 
+_FOCUSED_TEST_ENVIRONMENT = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PYTHONHASHSEED": "0",
+}
+_FOCUSED_TEST_ENVIRONMENT_KEYS = frozenset(_FOCUSED_TEST_ENVIRONMENT)
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+_PYTHON_EXECUTABLE_PATTERN = re.compile(r"^python(?:3(?:\.\d+)?)?$", re.IGNORECASE)
+_TEST_SELECTOR_PATTERN = re.compile(
+    r"^[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*$"
+)
+
+
 class SQLiteStore:
     """A single SQLite connection with explicit, thread-guarded transactions."""
 
@@ -163,6 +178,12 @@ class SQLiteStore:
         "source_snapshot_json": "source_snapshot",
         "expected_identity_json": "expected_identity",
         "observed_identity_json": "observed_identity",
+        "command_argv_json": "command_argv",
+        "environment_json": "environment",
+        "workspace_manifest_json": "workspace_manifest",
+        "workspace_manifest_before_json": "workspace_manifest_before",
+        "workspace_manifest_after_json": "workspace_manifest_after",
+        "canonical_handoff_json": "canonical_handoff",
     }
 
     def __init__(
@@ -241,6 +262,11 @@ class SQLiteStore:
                     connection.execute(statement)
                 self._migrate_workspace_kinds(connection)
                 connection.execute("PRAGMA user_version = 5")
+                version = 5
+            if version == 5:
+                for statement in _SCHEMA_V6:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 6")
 
     @staticmethod
     def _migrate_workspace_kinds(connection: sqlite3.Connection) -> None:
@@ -2657,6 +2683,1171 @@ class SQLiteStore:
         ):
             raise LeaseConflict("attempt worktree identity changed before finalization")
 
+    @staticmethod
+    def _normalized_relative_test_path(value: str) -> str:
+        if not isinstance(value, str) or not value or "\\" in value:
+            raise ValueError("focused test_file must be a non-empty POSIX relative path")
+        path = PurePosixPath(value)
+        if path.is_absolute() or value != path.as_posix() or any(
+            part in ("", ".", "..") for part in path.parts
+        ):
+            raise ValueError("focused test_file must be a normalized relative path")
+        if path.parts[0] == ".git":
+            raise ValueError("focused test_file cannot target Git metadata")
+        return value
+
+    @staticmethod
+    def _normalize_focused_manifest(
+        value: Mapping[str, Mapping[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        if not isinstance(value, Mapping) or not value:
+            raise ValueError("focused workspace manifest must be a non-empty mapping")
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for raw_path, raw_identity in value.items():
+            path = SQLiteStore._normalized_relative_test_path(str(raw_path))
+            if path in normalized:
+                raise ValueError("focused workspace manifest paths must be unique")
+            if not isinstance(raw_identity, Mapping) or set(raw_identity) != {
+                "sha256",
+                "mode",
+            }:
+                raise ValueError(
+                    "focused workspace manifest entries require sha256 and mode exactly"
+                )
+            digest = raw_identity["sha256"]
+            mode = raw_identity["mode"]
+            if not isinstance(digest, str) or _SHA256_PATTERN.fullmatch(digest) is None:
+                raise ValueError("focused workspace manifest hashes must be lowercase SHA-256")
+            if (
+                not isinstance(mode, int)
+                or isinstance(mode, bool)
+                or not stat.S_ISREG(mode)
+            ):
+                raise ValueError("focused workspace manifest entries must be regular files")
+            normalized[path] = {"sha256": digest, "mode": mode}
+        return {path: normalized[path] for path in sorted(normalized)}
+
+    @staticmethod
+    def _hash_file(
+        path: Path, expected: Optional[os.stat_result] = None
+    ) -> str:
+        digest = hashlib.sha256()
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+        try:
+            before = os.fstat(descriptor)
+            if expected is not None and any(
+                observed != persisted
+                for observed, persisted in (
+                    (before.st_dev, expected.st_dev),
+                    (before.st_ino, expected.st_ino),
+                    (before.st_uid, expected.st_uid),
+                    (before.st_mode, expected.st_mode),
+                    (before.st_nlink, expected.st_nlink),
+                    (before.st_size, expected.st_size),
+                )
+            ):
+                raise LeaseConflict("file identity changed before it was opened")
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+            ):
+                raise LeaseConflict("file identity changed while it was being hashed")
+        finally:
+            os.close(descriptor)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _focused_executable_identity(executable_path: str) -> Dict[str, Any]:
+        supplied = Path(executable_path).expanduser()
+        if not supplied.is_absolute():
+            raise ValueError("focused Python executable must be an absolute path")
+        try:
+            resolved = supplied.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise ValueError("focused Python executable does not exist") from error
+        if str(supplied) != str(resolved):
+            raise ValueError("focused Python executable must already be fully resolved")
+        details = resolved.lstat()
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink < 1:
+            raise ValueError("focused Python executable must be a regular file")
+        if details.st_mode & 0o022:
+            raise ValueError("focused Python executable cannot be group/world writable")
+        if _PYTHON_EXECUTABLE_PATTERN.fullmatch(resolved.name) is None:
+            raise ValueError("focused executable must be a resolved Python interpreter")
+        return {
+            "path": str(resolved),
+            "device": int(details.st_dev),
+            "inode": int(details.st_ino),
+            "owner_uid": int(details.st_uid),
+            "mode": int(details.st_mode),
+            "sha256": SQLiteStore._hash_file(resolved, details),
+        }
+
+    @staticmethod
+    def _scan_focused_workspace(root: Path) -> Dict[str, Dict[str, Any]]:
+        try:
+            resolved = root.resolve(strict=True)
+        except FileNotFoundError as error:
+            raise LeaseConflict("focused test worktree is absent") from error
+        root_details = resolved.lstat()
+        if not stat.S_ISDIR(root_details.st_mode) or root_details.st_uid != os.getuid():
+            raise LeaseConflict("focused test worktree must be a user-owned directory")
+        manifest: Dict[str, Dict[str, Any]] = {}
+        for directory, directory_names, file_names in os.walk(
+            str(resolved), topdown=True, followlinks=False
+        ):
+            current = Path(directory)
+            relative_directory = current.relative_to(resolved)
+            kept_directories: List[str] = []
+            for name in sorted(directory_names):
+                relative = relative_directory / name
+                if relative.parts and relative.parts[0] == ".git":
+                    continue
+                details = (current / name).lstat()
+                if not stat.S_ISDIR(details.st_mode):
+                    raise LeaseConflict(
+                        "focused workspace contains a non-directory traversal entry: %s"
+                        % relative.as_posix()
+                    )
+                if details.st_uid != os.getuid():
+                    raise LeaseConflict(
+                        "focused workspace directory is not user-owned: %s"
+                        % relative.as_posix()
+                    )
+                kept_directories.append(name)
+            directory_names[:] = kept_directories
+            for name in sorted(file_names):
+                relative = relative_directory / name
+                if relative.parts and relative.parts[0] == ".git":
+                    continue
+                path = current / name
+                details = path.lstat()
+                if (
+                    not stat.S_ISREG(details.st_mode)
+                    or details.st_uid != os.getuid()
+                    or details.st_nlink != 1
+                ):
+                    raise LeaseConflict(
+                        "focused workspace file is not a user-owned, single-link regular file: %s"
+                        % relative.as_posix()
+                    )
+                manifest[relative.as_posix()] = {
+                    "sha256": SQLiteStore._hash_file(path, details),
+                    "mode": int(details.st_mode),
+                }
+        return {path: manifest[path] for path in sorted(manifest)}
+
+    @staticmethod
+    def _paths_overlap(first: Path, second: Path) -> bool:
+        try:
+            first.relative_to(second)
+            return True
+        except ValueError:
+            pass
+        try:
+            second.relative_to(first)
+            return True
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _assert_private_directory(path: Path) -> os.stat_result:
+        details = path.lstat()
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise LeaseConflict(
+                "focused runtime directories must be private user-owned directories"
+            )
+        return details
+
+    @staticmethod
+    def _create_private_directory(path: Path, *, parents: bool = False) -> None:
+        path.mkdir(mode=0o700, parents=parents, exist_ok=False)
+        os.chmod(path, 0o700)
+        SQLiteStore._assert_private_directory(path)
+
+    @staticmethod
+    def _focused_environment(
+        value: Optional[Mapping[str, str]],
+    ) -> Dict[str, str]:
+        environment = dict(_FOCUSED_TEST_ENVIRONMENT if value is None else value)
+        if set(environment) != _FOCUSED_TEST_ENVIRONMENT_KEYS:
+            raise ValueError(
+                "focused test environment must contain only LANG, LC_ALL, and PYTHONHASHSEED"
+            )
+        if any(
+            not isinstance(entry, str) or not entry or len(entry) > 256
+            for entry in environment.values()
+        ):
+            raise ValueError("focused test environment values must be bounded strings")
+        return {key: environment[key] for key in sorted(environment)}
+
+    def create_focused_test_plan(
+        self,
+        work_item_id: str,
+        *,
+        executable_path: str,
+        test_file: str,
+        selector: str,
+        workspace_manifest: Mapping[str, Mapping[str, Any]],
+        runtime_root: str,
+        timeout_seconds: float = 120.0,
+        output_limit_bytes: int = 1024 * 1024,
+        environment: Optional[Mapping[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Register one immutable revision of a supervisor-owned focused-test plan."""
+
+        test_file = self._normalized_relative_test_path(test_file)
+        if _TEST_SELECTOR_PATTERN.fullmatch(selector) is None:
+            raise ValueError("focused selector must be exactly ClassName.test_method")
+        manifest = self._normalize_focused_manifest(workspace_manifest)
+        if test_file not in manifest:
+            raise ValueError("focused test_file must be present in the workspace manifest")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or timeout_seconds <= 0
+            or timeout_seconds > 3600
+        ):
+            raise ValueError("focused test timeout must be in (0, 3600] seconds")
+        if (
+            not isinstance(output_limit_bytes, int)
+            or isinstance(output_limit_bytes, bool)
+            or output_limit_bytes < 1024
+            or output_limit_bytes > 16 * 1024 * 1024
+        ):
+            raise ValueError("focused output limit must be between 1024 and 16777216 bytes")
+        executable = self._focused_executable_identity(executable_path)
+        base_environment = self._focused_environment(environment)
+        supplied_runtime_root = Path(runtime_root).expanduser()
+        if not supplied_runtime_root.is_absolute():
+            raise ValueError("focused runtime_root must be an absolute path")
+        normalized_runtime_root = supplied_runtime_root.resolve()
+        if str(supplied_runtime_root) != str(normalized_runtime_root):
+            raise ValueError("focused runtime_root must already be fully resolved")
+        if normalized_runtime_root.exists():
+            self._assert_private_directory(normalized_runtime_root)
+        else:
+            self._create_private_directory(normalized_runtime_root, parents=True)
+
+        plan_id = _id()
+        now = self._clock()
+        manifest_hash = hashlib.sha256(_dump(manifest).encode("utf-8")).hexdigest()
+        environment_hash = hashlib.sha256(
+            _dump(base_environment).encode("utf-8")
+        ).hexdigest()
+        with self._transaction() as connection:
+            item = connection.execute(
+                """SELECT i.*, c.config_json
+                   FROM work_items i JOIN campaigns c ON c.id = i.campaign_id
+                   WHERE i.id = ?""",
+                (work_item_id,),
+            ).fetchone()
+            if item is None:
+                raise NotFoundError("work item %s not found" % work_item_id)
+            if item["state"] != "ready_for_test":
+                raise TransitionConflict(
+                    "focused test plans can be created only for ready-for-test items"
+                )
+            if _load(item["required_gates_json"], []) != ["focused_tests"]:
+                raise ValueError(
+                    "the focused collector slice supports exactly the focused_tests gate"
+                )
+            if _load(item["config_json"], {}).get("allow_simulated_evidence") is True:
+                raise ValueError("authoritative focused plans cannot be simulated")
+            previous_plan = connection.execute(
+                """SELECT * FROM focused_test_plans WHERE work_item_id = ?
+                   ORDER BY plan_number DESC LIMIT 1""",
+                (work_item_id,),
+            ).fetchone()
+            plan_number = 1
+            if previous_plan is not None:
+                plan_number = int(previous_plan["plan_number"]) + 1
+                immutable_authority = {
+                    "executable_path": executable["path"],
+                    "executable_device": executable["device"],
+                    "executable_inode": executable["inode"],
+                    "executable_owner_uid": executable["owner_uid"],
+                    "executable_mode": executable["mode"],
+                    "executable_sha256": executable["sha256"],
+                    "test_file": test_file,
+                    "selector": selector,
+                    "environment_json": _dump(base_environment),
+                    "environment_sha256": environment_hash,
+                    "runtime_root": str(normalized_runtime_root),
+                    "timeout_seconds": float(timeout_seconds),
+                    "output_limit_bytes": output_limit_bytes,
+                }
+                changed_authority = [
+                    name
+                    for name, value in immutable_authority.items()
+                    if previous_plan[name] != value
+                ]
+                if changed_authority:
+                    raise TransitionConflict(
+                        "focused plan revisions cannot change test authority: %s"
+                        % ", ".join(sorted(changed_authority))
+                    )
+                previous_manifest = self._normalize_focused_manifest(
+                    _load(previous_plan["workspace_manifest_json"], {})
+                )
+                if previous_manifest[test_file] != manifest[test_file]:
+                    raise TransitionConflict(
+                        "focused plan revisions cannot change the trusted test file"
+                    )
+            connection.execute(
+                """INSERT INTO focused_test_plans
+                   (id, work_item_id, plan_number, executable_path, executable_device,
+                    executable_inode, executable_owner_uid, executable_mode,
+                    executable_sha256, test_file, selector, environment_json,
+                    environment_sha256, workspace_manifest_json,
+                    workspace_manifest_sha256, runtime_root, timeout_seconds,
+                    output_limit_bytes, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_id,
+                    work_item_id,
+                    plan_number,
+                    executable["path"],
+                    executable["device"],
+                    executable["inode"],
+                    executable["owner_uid"],
+                    executable["mode"],
+                    executable["sha256"],
+                    test_file,
+                    selector,
+                    _dump(base_environment),
+                    environment_hash,
+                    _dump(manifest),
+                    manifest_hash,
+                    str(normalized_runtime_root),
+                    float(timeout_seconds),
+                    output_limit_bytes,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "focused_test.plan_created",
+                campaign_id=item["campaign_id"],
+                work_item_id=work_item_id,
+                event_data={
+                    "plan_id": plan_id,
+                    "plan_number": plan_number,
+                    "selector": selector,
+                    "test_file": test_file,
+                },
+                created_at=now,
+            )
+        return self.get_focused_test_plan(plan_id)
+
+    def get_focused_test_plan(self, plan_id: str) -> Dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM focused_test_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("focused test plan %s not found" % plan_id)
+        return self._row(row)  # type: ignore[return-value]
+
+    def list_focused_test_plans(
+        self, work_item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM focused_test_plans"
+        parameters: Sequence[Any] = ()
+        if work_item_id is not None:
+            sql += " WHERE work_item_id = ?"
+            parameters = (work_item_id,)
+        sql += " ORDER BY work_item_id, plan_number"
+        with self._lock:
+            return self._rows(self._connection.execute(sql, parameters).fetchall())
+
+    def _focused_execution_request(self, row: sqlite3.Row) -> Dict[str, Any]:
+        request = self._row(row)
+        assert request is not None
+        request["command"] = request["command_argv"]
+        request["workspace_manifest"] = request["workspace_manifest_before"]
+        return request
+
+    def prepare_focused_test_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Dict[str, Any]:
+        """Fence one focused execution to the current tester attempt and worktree."""
+
+        created_run_parent: Optional[Path] = None
+        try:
+            with self._transaction() as connection:
+                now = self._clock()
+                job = self._assert_live_lease(
+                    connection, job_id, worker_id, lease_token, now
+                )
+                if job["role"] != "tester":
+                    raise LeaseConflict("focused executions require a tester lease")
+                if job["workspace_kind"] != WorkspaceKind.MANAGED_WORKTREE.value:
+                    raise LeaseConflict("focused executions require a managed worktree")
+                self._assert_managed_worktree_binding(connection, job)
+                existing = connection.execute(
+                    "SELECT * FROM focused_test_executions WHERE attempt_id = ?",
+                    (job["current_attempt_id"],),
+                ).fetchone()
+                if existing is not None:
+                    return self._focused_execution_request(existing)
+                item = connection.execute(
+                    "SELECT required_gates_json FROM work_items WHERE id = ?",
+                    (job["work_item_id"],),
+                ).fetchone()
+                if item is None:
+                    raise NotFoundError("work item %s not found" % job["work_item_id"])
+                if _load(item["required_gates_json"], []) != ["focused_tests"]:
+                    raise ValueError(
+                        "the focused collector slice supports exactly the focused_tests gate"
+                    )
+                plan = connection.execute(
+                    """SELECT * FROM focused_test_plans WHERE work_item_id = ?
+                       ORDER BY plan_number DESC LIMIT 1""",
+                    (job["work_item_id"],),
+                ).fetchone()
+                if plan is None:
+                    raise LeaseConflict("current work item has no authoritative focused test plan")
+                worktree = connection.execute(
+                    "SELECT * FROM managed_worktrees WHERE id = ? AND state = 'ready'",
+                    (job["managed_worktree_id"],),
+                ).fetchone()
+                if worktree is None:
+                    raise LeaseConflict("managed worktree is not ready")
+
+                cwd = Path(str(worktree["worktree_path"])).resolve(strict=True)
+                cwd_details = cwd.lstat()
+                if (
+                    not stat.S_ISDIR(cwd_details.st_mode)
+                    or int(cwd_details.st_dev) != worktree["worktree_device"]
+                    or int(cwd_details.st_ino) != worktree["worktree_inode"]
+                    or int(cwd_details.st_uid) != worktree["worktree_owner_uid"]
+                ):
+                    raise LeaseConflict("focused test cwd identity changed")
+                executable = self._focused_executable_identity(str(plan["executable_path"]))
+                expected_executable = {
+                    "path": str(plan["executable_path"]),
+                    "device": int(plan["executable_device"]),
+                    "inode": int(plan["executable_inode"]),
+                    "owner_uid": int(plan["executable_owner_uid"]),
+                    "mode": int(plan["executable_mode"]),
+                    "sha256": str(plan["executable_sha256"]),
+                }
+                if executable != expected_executable:
+                    raise LeaseConflict("focused Python executable identity changed")
+                expected_manifest = self._normalize_focused_manifest(
+                    _load(plan["workspace_manifest_json"], {})
+                )
+                observed_manifest = self._scan_focused_workspace(cwd)
+                if observed_manifest != expected_manifest:
+                    raise LeaseConflict("focused workspace differs from its immutable plan")
+                test_path = cwd / str(plan["test_file"])
+                if test_path.resolve(strict=True) != test_path or not test_path.is_file():
+                    raise LeaseConflict("focused test_file is not a contained regular file")
+
+                runtime_root = Path(str(plan["runtime_root"])).resolve(strict=True)
+                self._assert_private_directory(runtime_root)
+                repository_path = Path(str(worktree["repository_path"])).resolve(strict=True)
+                if self._paths_overlap(runtime_root, cwd) or self._paths_overlap(
+                    runtime_root, repository_path
+                ):
+                    raise LeaseConflict("focused runtime root overlaps a target repository")
+                item_directory = runtime_root / str(job["work_item_id"])
+                if item_directory.exists():
+                    self._assert_private_directory(item_directory)
+                else:
+                    self._create_private_directory(item_directory)
+                run_parent = item_directory / str(job["current_attempt_id"])
+                self._create_private_directory(run_parent)
+                created_run_parent = run_parent
+                environment_directory = run_parent / "environment"
+                home_directory = environment_directory / "home"
+                temporary_directory = environment_directory / "tmp"
+                artifact_directory = run_parent / "artifacts"
+                if artifact_directory.exists():
+                    raise LeaseConflict("focused artifact directory already exists")
+
+                command = [
+                    executable["path"],
+                    "-I",
+                    "-B",
+                    str(test_path),
+                    str(plan["selector"]),
+                    "-v",
+                ]
+                command_hash = hashlib.sha256(_dump(command).encode("utf-8")).hexdigest()
+                base_environment = self._focused_environment(
+                    _load(plan["environment_json"], {})
+                )
+                effective_environment = dict(base_environment)
+                effective_environment.update(
+                    {"HOME": str(home_directory), "TMPDIR": str(temporary_directory)}
+                )
+                effective_environment = {
+                    key: effective_environment[key] for key in sorted(effective_environment)
+                }
+                environment_hash = hashlib.sha256(
+                    _dump(effective_environment).encode("utf-8")
+                ).hexdigest()
+                execution_id = _id()
+                stdout_path = artifact_directory / "stdout.log"
+                stderr_path = artifact_directory / "stderr.log"
+                connection.execute(
+                    """INSERT INTO focused_test_executions
+                       (id, plan_id, attempt_id, job_id, work_item_id,
+                        managed_worktree_id, managed_worktree_generation, status,
+                        executable_path, executable_device, executable_inode,
+                        executable_owner_uid, executable_mode, executable_sha256,
+                        test_file, selector, command_argv_json, command_argv_sha256,
+                        environment_json, environment_sha256, cwd, cwd_device,
+                        cwd_inode, cwd_owner_uid, cwd_mode,
+                        workspace_manifest_before_json,
+                        workspace_manifest_before_sha256, run_parent,
+                        artifact_directory, stdout_path, stderr_path,
+                        timeout_seconds, output_limit_bytes, prepared_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?)""",
+                    (
+                        execution_id,
+                        plan["id"],
+                        job["current_attempt_id"],
+                        job_id,
+                        job["work_item_id"],
+                        worktree["id"],
+                        worktree["generation"],
+                        executable["path"],
+                        executable["device"],
+                        executable["inode"],
+                        executable["owner_uid"],
+                        executable["mode"],
+                        executable["sha256"],
+                        plan["test_file"],
+                        plan["selector"],
+                        _dump(command),
+                        command_hash,
+                        _dump(effective_environment),
+                        environment_hash,
+                        str(cwd),
+                        int(cwd_details.st_dev),
+                        int(cwd_details.st_ino),
+                        int(cwd_details.st_uid),
+                        int(cwd_details.st_mode),
+                        _dump(observed_manifest),
+                        plan["workspace_manifest_sha256"],
+                        str(run_parent),
+                        str(artifact_directory),
+                        str(stdout_path),
+                        str(stderr_path),
+                        plan["timeout_seconds"],
+                        plan["output_limit_bytes"],
+                        now,
+                        now,
+                    ),
+                )
+                self._append_event(
+                    connection,
+                    "focused_test.execution_prepared",
+                    campaign_id=job["campaign_id"],
+                    work_item_id=job["work_item_id"],
+                    job_id=job_id,
+                    actor=worker_id,
+                    event_data={
+                        "execution_id": execution_id,
+                        "attempt_id": job["current_attempt_id"],
+                        "plan_id": plan["id"],
+                    },
+                    created_at=now,
+                )
+                prepared = connection.execute(
+                    "SELECT * FROM focused_test_executions WHERE id = ?",
+                    (execution_id,),
+                ).fetchone()
+                assert prepared is not None
+                return self._focused_execution_request(prepared)
+        except BaseException:
+            if created_run_parent is not None and created_run_parent.exists():
+                for child in sorted(created_run_parent.rglob("*"), reverse=True):
+                    if child.is_dir():
+                        child.rmdir()
+                    else:
+                        child.unlink()
+                created_run_parent.rmdir()
+            raise
+
+    @staticmethod
+    def _inspect_private_output(
+        path: Path, output_limit_bytes: int
+    ) -> tuple[Dict[str, Any], bytes]:
+        details = path.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_nlink != 1
+            or details.st_mode & 0o077
+        ):
+            raise LeaseConflict(
+                "focused output must be a private user-owned single-link regular file"
+            )
+        if details.st_size > output_limit_bytes:
+            raise LeaseConflict("focused output exceeds its persisted capture limit")
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(str(path), flags)
+        content = bytearray()
+        digest = hashlib.sha256()
+        try:
+            before = os.fstat(descriptor)
+            if any(
+                observed != persisted
+                for observed, persisted in (
+                    (before.st_dev, details.st_dev),
+                    (before.st_ino, details.st_ino),
+                    (before.st_uid, details.st_uid),
+                    (before.st_mode, details.st_mode),
+                    (before.st_nlink, details.st_nlink),
+                    (before.st_size, details.st_size),
+                )
+            ):
+                raise LeaseConflict("focused output changed before it was opened")
+            while True:
+                chunk = os.read(descriptor, 64 * 1024)
+                if not chunk:
+                    break
+                content.extend(chunk)
+                digest.update(chunk)
+            after = os.fstat(descriptor)
+            if (
+                before.st_dev != after.st_dev
+                or before.st_ino != after.st_ino
+                or before.st_size != after.st_size
+                or before.st_mtime_ns != after.st_mtime_ns
+                or len(content) != after.st_size
+            ):
+                raise LeaseConflict("focused output identity changed while being verified")
+        finally:
+            os.close(descriptor)
+        return (
+            {
+                "device": int(before.st_dev),
+                "inode": int(before.st_ino),
+                "owner_uid": int(before.st_uid),
+                "mode": int(before.st_mode),
+                "nlink": int(before.st_nlink),
+                "bytes": len(content),
+                "sha256": digest.hexdigest(),
+            },
+            bytes(content),
+        )
+
+    @staticmethod
+    def _assert_focused_runtime_layout(execution: sqlite3.Row) -> None:
+        run_parent = Path(str(execution["run_parent"]))
+        SQLiteStore._assert_private_directory(run_parent)
+        expected_environment_root = run_parent / "environment"
+        expected_home = expected_environment_root / "home"
+        expected_temporary = expected_environment_root / "tmp"
+        environment = _load(execution["environment_json"], {})
+        if environment.get("HOME") != str(expected_home) or environment.get(
+            "TMPDIR"
+        ) != str(expected_temporary):
+            raise LeaseConflict("focused environment paths changed after preparation")
+        SQLiteStore._assert_private_directory(expected_environment_root)
+        SQLiteStore._assert_private_directory(expected_home)
+        SQLiteStore._assert_private_directory(expected_temporary)
+        artifact_directory = Path(str(execution["artifact_directory"]))
+        if artifact_directory != run_parent / "artifacts":
+            raise LeaseConflict("focused artifact directory changed after preparation")
+        SQLiteStore._assert_private_directory(artifact_directory)
+
+    @staticmethod
+    def _focused_semantic_outcome(
+        selector: str, exit_code: int, stdout: bytes, stderr: bytes
+    ) -> tuple[str, str]:
+        try:
+            text = (stdout + b"\n" + stderr).decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise ValueError("focused unittest output must be valid UTF-8") from error
+        class_name, method_name = selector.split(".", 1)
+        status_pattern = re.compile(
+            r"^%s \(__main__\.%s\) \.\.\. (ok|FAIL|ERROR)$"
+            % (re.escape(method_name), re.escape(class_name)),
+            re.MULTILINE,
+        )
+        statuses = status_pattern.findall(text)
+        ran_lines = re.findall(r"^Ran 1 test in [0-9]+(?:\.[0-9]+)?s$", text, re.MULTILINE)
+        if len(statuses) != 1 or len(ran_lines) != 1:
+            raise ValueError(
+                "focused unittest output does not prove exactly the persisted selector"
+            )
+        nonempty_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if not nonempty_lines:
+            raise ValueError("focused unittest output is empty")
+        final_line = nonempty_lines[-1]
+        status = statuses[0]
+        if exit_code == 0 and status == "ok" and final_line == "OK":
+            return "pass", "exactly one persisted focused unittest selector passed"
+        if (
+            exit_code != 0
+            and status in ("FAIL", "ERROR")
+            and final_line.startswith("FAILED (")
+        ):
+            return "fail", "exactly one persisted focused unittest selector failed"
+        raise ValueError(
+            "focused unittest exit code and exact one-test summary do not agree"
+        )
+
+    @staticmethod
+    def _canonical_focused_handoff(
+        execution: Mapping[str, Any],
+        stdout_artifact: Mapping[str, Any],
+        stderr_artifact: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        outcome = str(execution["outcome"])
+        passed = outcome == "pass"
+        summary = str(execution["semantic_summary"])
+        evidence = [
+            {
+                "id": stdout_artifact["id"],
+                "kind": "test",
+                "location": stdout_artifact["uri"],
+                "description": "Authoritative bounded stdout for the focused unittest run.",
+                "metadata": {
+                    "attempt_id": execution["attempt_id"],
+                    "execution_id": execution["id"],
+                    "sha256": execution["stdout_sha256"],
+                    "bytes": execution["stdout_bytes"],
+                },
+            },
+            {
+                "id": stderr_artifact["id"],
+                "kind": "log",
+                "location": stderr_artifact["uri"],
+                "description": "Authoritative bounded stderr for the focused unittest run.",
+                "metadata": {
+                    "attempt_id": execution["attempt_id"],
+                    "execution_id": execution["id"],
+                    "sha256": execution["stderr_sha256"],
+                    "bytes": execution["stderr_bytes"],
+                },
+            },
+        ]
+        return {
+            "schema_version": 1,
+            "item_id": execution["work_item_id"],
+            "outcome": "pass" if passed else "red",
+            "summary": summary,
+            "gate_proofs": [
+                {
+                    "gate": "focused_tests",
+                    "result": "pass" if passed else "fail",
+                    "summary": summary,
+                    "evidence": evidence,
+                }
+            ],
+            "failure_summary": None if passed else summary,
+            "blocker": None,
+        }
+
+    def _assert_finished_focused_execution(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        execution: sqlite3.Row,
+    ) -> tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+        if (
+            execution["status"] != "finished"
+            or execution["attempt_id"] != job["current_attempt_id"]
+            or execution["job_id"] != job["id"]
+            or execution["work_item_id"] != job["work_item_id"]
+            or execution["managed_worktree_id"] != job["managed_worktree_id"]
+        ):
+            raise LeaseConflict(
+                "current tester attempt has no finished authoritative focused execution"
+            )
+        self._assert_managed_worktree_binding(connection, job)
+        attempt = connection.execute(
+            "SELECT managed_worktree_generation FROM attempts WHERE id = ?",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if (
+            attempt is None
+            or execution["managed_worktree_generation"]
+            != attempt["managed_worktree_generation"]
+        ):
+            raise LeaseConflict("focused execution worktree generation changed")
+        external = connection.execute(
+            "SELECT * FROM external_processes WHERE attempt_id = ?",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if (
+            external is None
+            or external["provider"] != "focused_test"
+            or external["state"] != "stopped"
+            or external["target_executable"] != execution["executable_path"]
+        ):
+            raise LeaseConflict(
+                "focused execution requires its exact durably stopped process"
+            )
+        executable = self._focused_executable_identity(str(execution["executable_path"]))
+        if executable != {
+            "path": execution["executable_path"],
+            "device": execution["executable_device"],
+            "inode": execution["executable_inode"],
+            "owner_uid": execution["executable_owner_uid"],
+            "mode": execution["executable_mode"],
+            "sha256": execution["executable_sha256"],
+        }:
+            raise LeaseConflict("focused execution executable changed after collection")
+        cwd = Path(str(execution["cwd"]))
+        cwd_details = cwd.lstat()
+        if (
+            not stat.S_ISDIR(cwd_details.st_mode)
+            or int(cwd_details.st_dev) != execution["cwd_device"]
+            or int(cwd_details.st_ino) != execution["cwd_inode"]
+            or int(cwd_details.st_uid) != execution["cwd_owner_uid"]
+            or int(cwd_details.st_mode) != execution["cwd_mode"]
+        ):
+            raise LeaseConflict("focused execution cwd changed after collection")
+        manifest = self._scan_focused_workspace(cwd)
+        before = self._normalize_focused_manifest(
+            _load(execution["workspace_manifest_before_json"], {})
+        )
+        after = self._normalize_focused_manifest(
+            _load(execution["workspace_manifest_after_json"], {})
+        )
+        if manifest != before or manifest != after:
+            raise LeaseConflict("focused workspace changed after collection")
+        self._assert_focused_runtime_layout(execution)
+        stdout_identity, stdout = self._inspect_private_output(
+            Path(str(execution["stdout_path"])), int(execution["output_limit_bytes"])
+        )
+        stderr_identity, stderr = self._inspect_private_output(
+            Path(str(execution["stderr_path"])), int(execution["output_limit_bytes"])
+        )
+        for prefix, identity in (("stdout", stdout_identity), ("stderr", stderr_identity)):
+            for name in ("device", "inode", "owner_uid", "mode", "nlink", "bytes", "sha256"):
+                if identity[name] != execution["%s_%s" % (prefix, name)]:
+                    raise LeaseConflict("focused %s artifact changed after collection" % prefix)
+        outcome, semantic_summary = self._focused_semantic_outcome(
+            str(execution["selector"]), int(execution["exit_code"]), stdout, stderr
+        )
+        if outcome != execution["outcome"] or semantic_summary != execution["semantic_summary"]:
+            raise LeaseConflict("focused execution semantics changed after collection")
+        artifact_rows = connection.execute(
+            """SELECT * FROM artifacts
+               WHERE id IN (?, ?) AND attempt_id = ? AND job_id = ?""",
+            (
+                execution["stdout_artifact_id"],
+                execution["stderr_artifact_id"],
+                job["current_attempt_id"],
+                job["id"],
+            ),
+        ).fetchall()
+        artifacts = {row["id"]: self._row(row) for row in artifact_rows}
+        if set(artifacts) != {
+            execution["stdout_artifact_id"],
+            execution["stderr_artifact_id"],
+        }:
+            raise LeaseConflict("focused execution artifact bindings are incomplete")
+        execution_data = self._row(execution)
+        assert execution_data is not None
+        stdout_artifact = artifacts[execution["stdout_artifact_id"]]
+        stderr_artifact = artifacts[execution["stderr_artifact_id"]]
+        assert stdout_artifact is not None and stderr_artifact is not None
+        canonical = self._canonical_focused_handoff(
+            execution_data, stdout_artifact, stderr_artifact
+        )
+        persisted_canonical = _load(execution["canonical_handoff_json"], None)
+        if persisted_canonical is not None and persisted_canonical != canonical:
+            raise LeaseConflict("focused canonical handoff changed after collection")
+        return execution_data, stdout_artifact, stderr_artifact
+
+    def complete_focused_test_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Validate and atomically persist one current-attempt focused result."""
+
+        if not isinstance(result, Mapping):
+            raise ValueError("focused execution result must be a mapping")
+        with self._transaction() as connection:
+            now = self._clock()
+            job = self._assert_live_lease(
+                connection, job_id, worker_id, lease_token, now
+            )
+            if job["role"] != "tester":
+                raise LeaseConflict("focused completion requires a tester lease")
+            self._assert_managed_worktree_binding(connection, job)
+            execution = connection.execute(
+                "SELECT * FROM focused_test_executions WHERE attempt_id = ?",
+                (job["current_attempt_id"],),
+            ).fetchone()
+            if execution is None or execution["status"] != "prepared":
+                raise LeaseConflict("current tester attempt has no prepared focused execution")
+
+            required_exact = {
+                "execution_id": execution["id"],
+                "command": _load(execution["command_argv_json"], []),
+                "cwd": execution["cwd"],
+                "artifact_directory": execution["artifact_directory"],
+            }
+            for name, expected in required_exact.items():
+                observed = result.get(name)
+                if name == "command" and not isinstance(observed, (str, bytes)):
+                    observed = list(observed or [])
+                if observed != expected:
+                    raise LeaseConflict("focused result %s differs from its prepared value" % name)
+            workspace_manifest = self._normalize_focused_manifest(
+                result.get("workspace_manifest", {})  # type: ignore[arg-type]
+            )
+            expected_manifest = self._normalize_focused_manifest(
+                _load(execution["workspace_manifest_before_json"], {})
+            )
+            observed_manifest = self._scan_focused_workspace(Path(str(execution["cwd"])))
+            if workspace_manifest != expected_manifest or observed_manifest != expected_manifest:
+                raise LeaseConflict("focused workspace changed during execution")
+
+            for name in ("stdout_truncated", "stderr_truncated"):
+                if result.get(name) is not False:
+                    raise ValueError("focused truncated output cannot become evidence")
+            exit_code = result.get("exit_code")
+            if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+                raise ValueError("focused exit_code must be an integer")
+            self._assert_external_process_stopped(connection, job)
+            external = connection.execute(
+                "SELECT * FROM external_processes WHERE attempt_id = ?",
+                (job["current_attempt_id"],),
+            ).fetchone()
+            if (
+                external is None
+                or external["provider"] != "focused_test"
+                or external["state"] != "stopped"
+                or external["target_executable"] != execution["executable_path"]
+            ):
+                raise LeaseConflict(
+                    "focused completion requires its exact durably stopped process"
+                )
+
+            self._assert_focused_runtime_layout(execution)
+            output_limit = int(execution["output_limit_bytes"])
+            outputs: Dict[str, tuple[Dict[str, Any], bytes]] = {}
+            for prefix in ("stdout", "stderr"):
+                expected_path = str(execution["%s_path" % prefix])
+                if result.get("%s_path" % prefix) != expected_path:
+                    raise LeaseConflict("focused %s path differs from its prepared value" % prefix)
+                identity, content = self._inspect_private_output(
+                    Path(expected_path), output_limit
+                )
+                for field in ("sha256", "bytes"):
+                    if result.get("%s_%s" % (prefix, field)) != identity[field]:
+                        raise LeaseConflict(
+                            "focused %s %s differs from the verified artifact"
+                            % (prefix, field)
+                        )
+                outputs[prefix] = (identity, content)
+
+            executable = self._focused_executable_identity(str(execution["executable_path"]))
+            for field in ("path", "device", "inode", "owner_uid", "mode", "sha256"):
+                execution_field = (
+                    "executable_path" if field == "path" else "executable_%s" % field
+                )
+                if executable[field] != execution[execution_field]:
+                    raise LeaseConflict("focused executable changed during execution")
+            cwd_details = Path(str(execution["cwd"])).lstat()
+            if (
+                int(cwd_details.st_dev) != execution["cwd_device"]
+                or int(cwd_details.st_ino) != execution["cwd_inode"]
+                or int(cwd_details.st_uid) != execution["cwd_owner_uid"]
+                or int(cwd_details.st_mode) != execution["cwd_mode"]
+            ):
+                raise LeaseConflict("focused cwd changed during execution")
+
+            outcome, semantic_summary = self._focused_semantic_outcome(
+                str(execution["selector"]),
+                exit_code,
+                outputs["stdout"][1],
+                outputs["stderr"][1],
+            )
+            artifact_ids: Dict[str, str] = {}
+            artifact_kinds = (
+                ("stdout", "focused_test_stdout"),
+                ("stderr", "focused_test_stderr"),
+            )
+            for prefix, kind in artifact_kinds:
+                identity = outputs[prefix][0]
+                artifact_id = _id()
+                artifact_ids[prefix] = artifact_id
+                connection.execute(
+                    """INSERT INTO artifacts
+                       (id, work_item_id, job_id, attempt_id, kind, uri,
+                        metadata_json, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        artifact_id,
+                        job["work_item_id"],
+                        job_id,
+                        job["current_attempt_id"],
+                        kind,
+                        execution["%s_path" % prefix],
+                        _dump(
+                            {
+                                "attempt_id": job["current_attempt_id"],
+                                "execution_id": execution["id"],
+                                "sha256": identity["sha256"],
+                                "bytes": identity["bytes"],
+                            }
+                        ),
+                        now,
+                    ),
+                )
+            stdout_identity = outputs["stdout"][0]
+            stderr_identity = outputs["stderr"][0]
+            changed = connection.execute(
+                """UPDATE focused_test_executions
+                   SET status = 'finished', outcome = ?,
+                       workspace_manifest_after_json = ?,
+                       workspace_manifest_after_sha256 = ?,
+                       stdout_device = ?, stdout_inode = ?, stdout_owner_uid = ?,
+                       stdout_mode = ?, stdout_nlink = ?, stdout_bytes = ?,
+                       stdout_sha256 = ?, stdout_truncated = 0,
+                       stderr_device = ?, stderr_inode = ?, stderr_owner_uid = ?,
+                       stderr_mode = ?, stderr_nlink = ?, stderr_bytes = ?,
+                       stderr_sha256 = ?, stderr_truncated = 0,
+                       stdout_artifact_id = ?, stderr_artifact_id = ?,
+                       exit_code = ?, semantic_summary = ?, finished_at = ?,
+                       updated_at = ?
+                   WHERE id = ? AND status = 'prepared'""",
+                (
+                    outcome,
+                    _dump(observed_manifest),
+                    hashlib.sha256(_dump(observed_manifest).encode("utf-8")).hexdigest(),
+                    stdout_identity["device"],
+                    stdout_identity["inode"],
+                    stdout_identity["owner_uid"],
+                    stdout_identity["mode"],
+                    stdout_identity["nlink"],
+                    stdout_identity["bytes"],
+                    stdout_identity["sha256"],
+                    stderr_identity["device"],
+                    stderr_identity["inode"],
+                    stderr_identity["owner_uid"],
+                    stderr_identity["mode"],
+                    stderr_identity["nlink"],
+                    stderr_identity["bytes"],
+                    stderr_identity["sha256"],
+                    artifact_ids["stdout"],
+                    artifact_ids["stderr"],
+                    exit_code,
+                    semantic_summary,
+                    now,
+                    now,
+                    execution["id"],
+                ),
+            ).rowcount
+            if changed != 1:
+                raise LeaseConflict("focused execution changed during completion")
+            for prefix in ("stdout", "stderr"):
+                self._append_event(
+                    connection,
+                    "artifact.added",
+                    campaign_id=job["campaign_id"],
+                    work_item_id=job["work_item_id"],
+                    job_id=job_id,
+                    actor=worker_id,
+                    event_data={
+                        "artifact_id": artifact_ids[prefix],
+                        "attempt_id": job["current_attempt_id"],
+                        "execution_id": execution["id"],
+                        "kind": "focused_test_%s" % prefix,
+                        "uri": execution["%s_path" % prefix],
+                    },
+                    created_at=now,
+                )
+            self._append_event(
+                connection,
+                "focused_test.execution_finished",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "execution_id": execution["id"],
+                    "attempt_id": job["current_attempt_id"],
+                    "outcome": outcome,
+                    "exit_code": exit_code,
+                },
+                created_at=now,
+            )
+            finished = connection.execute(
+                "SELECT * FROM focused_test_executions WHERE id = ?",
+                (execution["id"],),
+            ).fetchone()
+            assert finished is not None
+            execution_data, stdout_artifact, stderr_artifact = (
+                self._assert_finished_focused_execution(connection, job, finished)
+            )
+            response = dict(execution_data)
+            canonical_handoff = self._canonical_focused_handoff(
+                execution_data, stdout_artifact, stderr_artifact
+            )
+            connection.execute(
+                """UPDATE focused_test_executions
+                   SET canonical_handoff_json = ?, updated_at = ?
+                   WHERE id = ? AND status = 'finished'""",
+                (_dump(canonical_handoff), now, execution["id"]),
+            )
+            response["canonical_handoff"] = canonical_handoff
+            return response
+
+    def get_focused_test_execution(self, execution_id: str) -> Dict[str, Any]:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM focused_test_executions WHERE id = ?", (execution_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("focused test execution %s not found" % execution_id)
+        return self._row(row)  # type: ignore[return-value]
+
+    def list_focused_test_executions(
+        self,
+        *,
+        work_item_id: Optional[str] = None,
+        job_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        parameters: List[Any] = []
+        for column, value in (
+            ("work_item_id", work_item_id),
+            ("job_id", job_id),
+            ("attempt_id", attempt_id),
+        ):
+            if value is not None:
+                clauses.append(column + " = ?")
+                parameters.append(value)
+        sql = "SELECT * FROM focused_test_executions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY prepared_at, id"
+        with self._lock:
+            return self._rows(self._connection.execute(sql, parameters).fetchall())
+
     def _finish_job(
         self, connection: sqlite3.Connection, job: sqlite3.Row, worker_id: str,
         lease_token: str, result: Mapping[str, Any], now: float
@@ -2712,6 +3903,14 @@ class SQLiteStore:
         """Validate untrusted stage output at the durable mutation boundary."""
 
         role = str(job["role"])
+        campaign = connection.execute(
+            "SELECT config_json FROM campaigns WHERE id = ?", (job["campaign_id"],)
+        ).fetchone()
+        if campaign is None:
+            raise NotFoundError("campaign %s not found" % job["campaign_id"])
+        allow_simulated = (
+            _load(campaign["config_json"], {}).get("allow_simulated_evidence") is True
+        )
         try:
             if role == "investigator":
                 handoff = InvestigationHandoff.model_validate(result)
@@ -2728,7 +3927,6 @@ class SQLiteStore:
                     else ItemState.READY_FOR_TEST
                 )
             elif role == "tester":
-                handoff = TestHandoff.model_validate(result)
                 item = connection.execute(
                     "SELECT required_gates_json FROM work_items WHERE id = ?",
                     (job["work_item_id"],),
@@ -2737,10 +3935,42 @@ class SQLiteStore:
                     raise NotFoundError(
                         "work item %s not found" % job["work_item_id"]
                     )
+                required_gates = _load(item["required_gates_json"], [])
+                if not allow_simulated and "focused_tests" in required_gates:
+                    if required_gates != ["focused_tests"]:
+                        raise ValueError(
+                            "tester handoff cannot advance: the authoritative focused "
+                            "collector slice supports exactly the focused_tests gate"
+                        )
+                    execution = connection.execute(
+                        """SELECT * FROM focused_test_executions
+                           WHERE attempt_id = ? AND job_id = ?""",
+                        (job["current_attempt_id"], job["id"]),
+                    ).fetchone()
+                    if execution is None:
+                        raise ValueError(
+                            "current tester attempt has no authoritative focused execution"
+                        )
+                    if execution["canonical_handoff_json"] is None:
+                        raise ValueError(
+                            "current focused execution has no persisted canonical handoff"
+                        )
+                    execution_data, stdout_artifact, stderr_artifact = (
+                        self._assert_finished_focused_execution(
+                            connection, job, execution
+                        )
+                    )
+                    handoff = TestHandoff.model_validate(
+                        self._canonical_focused_handoff(
+                            execution_data, stdout_artifact, stderr_artifact
+                        )
+                    )
+                else:
+                    handoff = TestHandoff.model_validate(result)
                 evaluation = evaluate_test_handoff(
                     tuple(
                         GateKind(gate)
-                        for gate in _load(item["required_gates_json"], [])
+                        for gate in required_gates
                     ),
                     handoff,
                 )
@@ -2761,14 +3991,6 @@ class SQLiteStore:
                 % (role, expected_next_state.value, next_item_state)
             )
 
-        campaign = connection.execute(
-            "SELECT config_json FROM campaigns WHERE id = ?", (job["campaign_id"],)
-        ).fetchone()
-        if campaign is None:
-            raise NotFoundError("campaign %s not found" % job["campaign_id"])
-        allow_simulated = (
-            _load(campaign["config_json"], {}).get("allow_simulated_evidence") is True
-        )
         for evidence in _handoff_evidence(handoff):
             if evidence.metadata.get("simulated") is True:
                 if not allow_simulated:
@@ -2884,6 +4106,39 @@ class SQLiteStore:
                 ).fetchone())
             return response
 
+    def _end_prepared_focused_execution(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        *,
+        status: str,
+        reason: str,
+        now: float,
+        actor: Optional[str] = None,
+    ) -> None:
+        if status not in ("abandoned", "quarantined"):
+            raise ValueError("focused execution terminal status is invalid")
+        changed = connection.execute(
+            """UPDATE focused_test_executions
+               SET status = ?, error = ?, finished_at = ?, updated_at = ?
+               WHERE attempt_id = ? AND status = 'prepared'""",
+            (status, reason, now, now, job["current_attempt_id"]),
+        ).rowcount
+        if changed:
+            self._append_event(
+                connection,
+                "focused_test.execution_%s" % status,
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job["id"],
+                actor=actor,
+                event_data={
+                    "attempt_id": job["current_attempt_id"],
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+
     def fail_job(
         self, job_id: str, worker_id: str, lease_token: str, error: str, *,
         result: Optional[Mapping[str, Any]] = None, requeue: bool = True,
@@ -2900,6 +4155,14 @@ class SQLiteStore:
             now = self._clock()
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
             self._assert_external_process_stopped(connection, job)
+            self._end_prepared_focused_execution(
+                connection,
+                job,
+                status="abandoned",
+                reason=error,
+                now=now,
+                actor=worker_id,
+            )
             attempt_status = "failed"
             connection.execute(
                 """UPDATE attempts SET status = ?, result_json = ?, error = ?, finished_at = ?
@@ -2996,6 +4259,14 @@ class SQLiteStore:
                 connection, job_id, worker_id, lease_token, now
             )
             self._assert_external_process_stopped(connection, job)
+            self._end_prepared_focused_execution(
+                connection,
+                job,
+                status="abandoned",
+                reason=reason,
+                now=now,
+                actor=worker_id,
+            )
             changed = connection.execute(
                 """UPDATE work_items SET state = ?, updated_at = ?
                    WHERE id = ? AND state = ?""",
@@ -3082,6 +4353,13 @@ class SQLiteStore:
             raise TransitionConflict(
                 "cannot recover expired job because item state is inconsistent"
             )
+        self._end_prepared_focused_execution(
+            connection,
+            job,
+            status="abandoned",
+            reason=error,
+            now=now,
+        )
         attempt_changed = connection.execute(
             """UPDATE attempts SET status = 'expired', finished_at = ?, error = ?
                WHERE id = ? AND status = 'running'""",
@@ -3363,6 +4641,14 @@ class SQLiteStore:
                 "observed": dict(observed or {}),
             }
             if status == "quarantined":
+                self._end_prepared_focused_execution(
+                    connection,
+                    job,
+                    status="quarantined",
+                    reason=reason,
+                    now=now,
+                    actor=owner,
+                )
                 connection.execute(
                     """UPDATE external_processes
                        SET state = 'quarantined', outcome = 'quarantined',
@@ -3445,7 +4731,8 @@ class SQLiteStore:
         campaign_id: Optional[str] = None,
         work_item_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        sql = """SELECT a.*, ep.state AS external_process_state,
+        sql = """SELECT a.*, ep.provider AS external_process_provider,
+                         ep.state AS external_process_state,
                          ep.identity_version AS external_process_identity_version,
                          ep.owner_uid AS external_process_owner_uid,
                          ep.start_seconds AS external_process_start_seconds,
@@ -3736,8 +5023,8 @@ class SQLiteStore:
             )
             existing = connection.execute(
                 """SELECT * FROM artifacts
-                   WHERE job_id = ? AND kind = ? AND uri = ?""",
-                (job_id, kind, normalized_uri),
+                   WHERE job_id = ? AND attempt_id = ? AND kind = ? AND uri = ?""",
+                (job_id, job["current_attempt_id"], kind, normalized_uri),
             ).fetchone()
             if existing is not None:
                 return self._row(existing)  # type: ignore[return-value]
@@ -3746,12 +5033,14 @@ class SQLiteStore:
             artifact_metadata["attempt_id"] = job["current_attempt_id"]
             connection.execute(
                 """INSERT INTO artifacts
-                   (id, work_item_id, job_id, kind, uri, metadata_json, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (id, work_item_id, job_id, attempt_id, kind, uri,
+                    metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     artifact_id,
                     job["work_item_id"],
                     job_id,
+                    job["current_attempt_id"],
                     kind,
                     normalized_uri,
                     _dump(artifact_metadata),
@@ -4038,4 +5327,113 @@ _SCHEMA_V5 = [
     """ALTER TABLE attempts ADD COLUMN managed_worktree_id TEXT
        REFERENCES managed_worktrees(id)""",
     """ALTER TABLE attempts ADD COLUMN managed_worktree_generation INTEGER""",
+]
+
+
+_SCHEMA_V6 = [
+    """ALTER TABLE artifacts ADD COLUMN attempt_id TEXT
+       REFERENCES attempts(id) ON DELETE CASCADE""",
+    """CREATE INDEX artifacts_attempt
+       ON artifacts(attempt_id, kind, created_at)""",
+    """CREATE TABLE focused_test_plans (
+        id TEXT PRIMARY KEY,
+        work_item_id TEXT NOT NULL
+            REFERENCES work_items(id) ON DELETE CASCADE,
+        plan_number INTEGER NOT NULL CHECK(plan_number > 0),
+        executable_path TEXT NOT NULL,
+        executable_device INTEGER NOT NULL CHECK(executable_device >= 0),
+        executable_inode INTEGER NOT NULL CHECK(executable_inode >= 0),
+        executable_owner_uid INTEGER NOT NULL CHECK(executable_owner_uid >= 0),
+        executable_mode INTEGER NOT NULL CHECK(executable_mode > 0),
+        executable_sha256 TEXT NOT NULL,
+        test_file TEXT NOT NULL,
+        selector TEXT NOT NULL,
+        environment_json TEXT NOT NULL,
+        environment_sha256 TEXT NOT NULL,
+        workspace_manifest_json TEXT NOT NULL,
+        workspace_manifest_sha256 TEXT NOT NULL,
+        runtime_root TEXT NOT NULL,
+        timeout_seconds REAL NOT NULL CHECK(timeout_seconds > 0),
+        output_limit_bytes INTEGER NOT NULL CHECK(output_limit_bytes > 0),
+        created_at REAL NOT NULL,
+        UNIQUE(work_item_id, plan_number))""",
+    """CREATE TABLE focused_test_executions (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL REFERENCES focused_test_plans(id) ON DELETE CASCADE,
+        attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        managed_worktree_id TEXT NOT NULL
+            REFERENCES managed_worktrees(id) ON DELETE CASCADE,
+        managed_worktree_generation INTEGER NOT NULL
+            CHECK(managed_worktree_generation > 0),
+        status TEXT NOT NULL,
+        outcome TEXT,
+        executable_path TEXT NOT NULL,
+        executable_device INTEGER NOT NULL CHECK(executable_device >= 0),
+        executable_inode INTEGER NOT NULL CHECK(executable_inode >= 0),
+        executable_owner_uid INTEGER NOT NULL CHECK(executable_owner_uid >= 0),
+        executable_mode INTEGER NOT NULL CHECK(executable_mode > 0),
+        executable_sha256 TEXT NOT NULL,
+        test_file TEXT NOT NULL,
+        selector TEXT NOT NULL,
+        command_argv_json TEXT NOT NULL,
+        command_argv_sha256 TEXT NOT NULL,
+        environment_json TEXT NOT NULL,
+        environment_sha256 TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        cwd_device INTEGER NOT NULL CHECK(cwd_device >= 0),
+        cwd_inode INTEGER NOT NULL CHECK(cwd_inode >= 0),
+        cwd_owner_uid INTEGER NOT NULL CHECK(cwd_owner_uid >= 0),
+        cwd_mode INTEGER NOT NULL CHECK(cwd_mode > 0),
+        workspace_manifest_before_json TEXT NOT NULL,
+        workspace_manifest_before_sha256 TEXT NOT NULL,
+        workspace_manifest_after_json TEXT,
+        workspace_manifest_after_sha256 TEXT,
+        run_parent TEXT NOT NULL,
+        artifact_directory TEXT NOT NULL UNIQUE,
+        stdout_path TEXT NOT NULL UNIQUE,
+        stderr_path TEXT NOT NULL UNIQUE,
+        timeout_seconds REAL NOT NULL CHECK(timeout_seconds > 0),
+        output_limit_bytes INTEGER NOT NULL CHECK(output_limit_bytes > 0),
+        stdout_device INTEGER CHECK(stdout_device IS NULL OR stdout_device >= 0),
+        stdout_inode INTEGER CHECK(stdout_inode IS NULL OR stdout_inode >= 0),
+        stdout_owner_uid INTEGER CHECK(stdout_owner_uid IS NULL OR stdout_owner_uid >= 0),
+        stdout_mode INTEGER CHECK(stdout_mode IS NULL OR stdout_mode > 0),
+        stdout_nlink INTEGER CHECK(stdout_nlink IS NULL OR stdout_nlink > 0),
+        stdout_bytes INTEGER CHECK(stdout_bytes IS NULL OR stdout_bytes >= 0),
+        stdout_sha256 TEXT,
+        stdout_truncated INTEGER NOT NULL DEFAULT 0
+            CHECK(stdout_truncated IN (0, 1)),
+        stderr_device INTEGER CHECK(stderr_device IS NULL OR stderr_device >= 0),
+        stderr_inode INTEGER CHECK(stderr_inode IS NULL OR stderr_inode >= 0),
+        stderr_owner_uid INTEGER CHECK(stderr_owner_uid IS NULL OR stderr_owner_uid >= 0),
+        stderr_mode INTEGER CHECK(stderr_mode IS NULL OR stderr_mode > 0),
+        stderr_nlink INTEGER CHECK(stderr_nlink IS NULL OR stderr_nlink > 0),
+        stderr_bytes INTEGER CHECK(stderr_bytes IS NULL OR stderr_bytes >= 0),
+        stderr_sha256 TEXT,
+        stderr_truncated INTEGER NOT NULL DEFAULT 0
+            CHECK(stderr_truncated IN (0, 1)),
+        stdout_artifact_id TEXT REFERENCES artifacts(id),
+        stderr_artifact_id TEXT REFERENCES artifacts(id),
+        exit_code INTEGER,
+        semantic_summary TEXT,
+        canonical_handoff_json TEXT,
+        error TEXT,
+        prepared_at REAL NOT NULL,
+        finished_at REAL,
+        updated_at REAL NOT NULL,
+        CHECK(status IN ('prepared', 'finished', 'abandoned', 'quarantined')),
+        CHECK(outcome IS NULL OR outcome IN ('pass', 'fail')),
+        CHECK((status = 'finished' AND outcome IS NOT NULL AND finished_at IS NOT NULL
+               AND exit_code IS NOT NULL AND semantic_summary IS NOT NULL
+               AND workspace_manifest_after_json IS NOT NULL
+               AND workspace_manifest_after_sha256 IS NOT NULL
+               AND stdout_artifact_id IS NOT NULL AND stderr_artifact_id IS NOT NULL)
+              OR status != 'finished'),
+        CHECK(stdout_path != stderr_path))""",
+    """CREATE INDEX focused_test_execution_item
+       ON focused_test_executions(work_item_id, prepared_at)""",
+    """CREATE INDEX focused_test_execution_job
+       ON focused_test_executions(job_id, prepared_at)""",
 ]

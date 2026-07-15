@@ -41,8 +41,8 @@ managed Git-worktree lifecycle while keeping Phase 1 storage authoritative. It
 includes:
 
 - strict investigator, fixer, and tester output schemas;
-- read-only investigator/tester execution and workspace-write fixer execution
-  only inside a validated distinct Git worktree;
+- read-only investigator execution and workspace-write fixer execution only
+  inside a validated distinct Git worktree;
 - prompt delivery through stdin with no shell and an allowlisted environment;
 - a stable blocked guardian that cannot start Codex until exact PID, PGID,
   UID, kernel birth, and executable registration is durable;
@@ -65,15 +65,27 @@ includes:
 - scheduler-fenced fixer authorization and same-worktree tester inheritance;
 - payload-independent workspace selection with exact pre/postflight Git and
   filesystem identity validation; and
+- immutable, revisioned supervisor-owned focused `unittest` plan snapshots for
+  the fixed disposable fixture, with each retest preserving the executable,
+  trusted test bytes, selector, environment, and limits while approving only a
+  new workspace manifest; an attempt/worktree-generation-bound deterministic
+  tester, bounded private output, semantic PASS/RED evaluation, and storage-side
+  canonical handoff replacement; and
 - an opt-in `prove-real-codex --acknowledge-live-model` command that accepts no
   target paths and proves the authenticated investigator -> managed fixer ->
-  same-worktree tester boundary against a fixed disposable fixture.
+  authoritative same-worktree focused tester boundary against a fixed
+  disposable fixture.
 
 This slice does not yet provide durable browser/database evidence collectors or
 general real-repository campaign execution. The current evidence attachment
-gate proves file existence but not the semantics of arbitrary test, browser, or
-database commands. Keep general real campaigns disabled until those collectors
-exist and are proven against disposable fixtures.
+gate remains non-authoritative for arbitrary test, browser, or database
+commands. The focused collector is authoritative only for the exact trusted
+fixture whose bytes are preflighted by the proof command. It is not an
+authorization boundary for arbitrary repository test code: it does not yet
+deny same-user filesystem access, network access, or detached child processes,
+and its semantic transcript evaluator is not a trusted general test harness.
+Keep general real campaigns disabled until an OS sandbox or trusted harness and
+the other evidence collectors exist and are proven against disposable fixtures.
 
 ## Architecture Rules
 
@@ -114,6 +126,8 @@ exist and are proven against disposable fixtures.
 - `workers.py`: worker protocol and deterministic fake workers only.
 - `codex_worker.py`: the least-privilege Codex subprocess, structured-output,
   process-reaping, session, and runtime-artifact boundary.
+- `focused_tests.py`: deterministic execution of storage-prepared focused-test
+  plans. It must not derive commands, paths, or environment from worker data.
 - `cli.py`: user-facing commands and status rendering. It must not duplicate
   workflow rules.
 
