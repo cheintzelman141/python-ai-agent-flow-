@@ -27,6 +27,16 @@ from agent_flow.codex_worker import (
     CodexCliWorker,
     codex_handoff_schema,
 )
+from agent_flow.focused_sandbox import (
+    DARWIN_SANDBOX_POLICY_VERSION,
+    build_command as build_focused_sandbox_command,
+    build_profile as build_focused_sandbox_profile,
+    direct_python_executable,
+    profile_sha256 as focused_sandbox_profile_sha256,
+    python_runtime_root,
+    python_runtime_sha256,
+    sandbox_executable,
+)
 from agent_flow.focused_tests import FocusedTestWorker
 from agent_flow.models import (
     FixHandoff,
@@ -119,7 +129,10 @@ class RealProofRunner:
         self.require_authenticated_provider = require_authenticated_provider
         self.inspector = GitInspector.controlled()
         self.git_executable = self.inspector.git_executable
-        self.python_executable = Path(sys.executable).resolve()
+        self.python_executable = direct_python_executable(
+            Path(sys.executable).resolve()
+        )
+        self.focused_sandbox_executable = sandbox_executable()
         if not self.python_executable.is_file():
             raise RealProofError("current Python executable is not an existing file")
         try:
@@ -138,6 +151,9 @@ class RealProofRunner:
             ),
             "python_executable": self._executable_record(
                 self.python_executable
+            ),
+            "focused_sandbox_executable": self._executable_record(
+                self.focused_sandbox_executable
             ),
         }
 
@@ -365,6 +381,27 @@ class RealProofRunner:
                 output_limit_bytes=1024 * 1024,
             )
             report["focused_test_plan_id"] = plan["id"]
+            tester_jobs = [
+                job
+                for job in store.list_jobs(work_item_id=item["id"])
+                if job["role"] == "tester" and job["status"] == "pending"
+            ]
+            if len(tester_jobs) != 1:
+                self._capture_store(report, store, campaign["id"], item["id"])
+                raise RealProofError(
+                    "fixed proof did not produce one exact pending tester job"
+                )
+            admission = store.create_focused_test_admission(
+                campaign["id"],
+                item["id"],
+                tester_jobs[0]["id"],
+                worktree["id"],
+                plan["id"],
+                [],
+                admitted_by="fixed-disposable-proof",
+                reason="authorize only the exact fixed disposable focused test",
+            )
+            report["focused_test_admission_id"] = admission["id"]
             focused_worker = FocusedTestWorker(
                 GuardedGitCommandRunner(
                     runtime=local_process_runtime(),
@@ -421,6 +458,9 @@ class RealProofRunner:
         )
         report["focused_test_executions"] = (
             store.list_focused_test_executions(work_item_id=item_id)
+        )
+        report["focused_test_admissions"] = (
+            store.list_focused_test_admissions(campaign_id=campaign_id)
         )
         report["events"] = store.list_events(work_item_id=item_id)
         report["resource_leases"] = store.list_resource_leases(
@@ -486,6 +526,15 @@ class RealProofRunner:
                 artifacts,
                 events,
                 worktree_path,
+                report,
+            )
+        )
+        report["focused_test_admission_proof"] = (
+            self._focused_test_admission_proof(
+                list(report.get("focused_test_admissions") or []),
+                jobs,
+                attempts,
+                events,
                 report,
             )
         )
@@ -883,6 +932,46 @@ class RealProofRunner:
         return True
 
     @staticmethod
+    def _focused_test_admission_proof(
+        admissions: Sequence[Mapping[str, Any]],
+        jobs: Sequence[Mapping[str, Any]],
+        attempts: Sequence[Mapping[str, Any]],
+        events: Sequence[Mapping[str, Any]],
+        report: Mapping[str, Any],
+    ) -> bool:
+        tester_jobs = [job for job in jobs if job.get("role") == "tester"]
+        if len(admissions) != 1 or len(tester_jobs) != 1:
+            return False
+        admission = admissions[0]
+        tester = tester_jobs[0]
+        tester_attempts = [
+            attempt
+            for attempt in attempts
+            if attempt.get("job_id") == tester.get("id")
+        ]
+        admitted_events = [
+            event
+            for event in events
+            if event.get("event_type") == "focused_test.admission_created"
+        ]
+        return (
+            admission.get("id") == report.get("focused_test_admission_id")
+            and admission.get("status") == "active"
+            and admission.get("campaign_id") == report.get("campaign_id")
+            and admission.get("work_item_id") == report.get("item_id")
+            and admission.get("tester_job_id") == tester.get("id")
+            and admission.get("managed_worktree_id") == report.get("worktree_id")
+            and admission.get("focused_test_plan_id")
+            == report.get("focused_test_plan_id")
+            and len(tester_attempts) == 1
+            and tester_attempts[0].get("focused_test_admission_id")
+            == admission.get("id")
+            and len(admitted_events) == 1
+            and (admitted_events[0].get("event_data") or {}).get("admission_id")
+            == admission.get("id")
+        )
+
+    @staticmethod
     def _sessions_distinct(attempts: Sequence[Mapping[str, Any]]) -> bool:
         sessions = [
             attempt.get("external_session_id")
@@ -916,7 +1005,9 @@ class RealProofRunner:
         }
         expected_target_by_provider = {
             "codex": codex.get("path"),
-            "focused_test": (report.get("python_executable") or {}).get("path"),
+            "focused_test": (
+                report.get("focused_sandbox_executable") or {}
+            ).get("path"),
         }
         if (
             len(attempts) != 3
@@ -1102,7 +1193,7 @@ class RealProofRunner:
         plan = plans[0]
         execution = executions[0]
         expected_manifest = self._workspace_manifest(worktree_path)
-        expected_command = [
+        expected_test_command = [
             str(self.python_executable),
             "-I",
             "-B",
@@ -1110,11 +1201,36 @@ class RealProofRunner:
             FOCUSED_TEST_SELECTOR,
             "-v",
         ]
+        expected_runtime_root = python_runtime_root(self.python_executable)
+        expected_runtime_hash = python_runtime_sha256(expected_runtime_root)
+        run_parent = Path(str(execution.get("run_parent") or ""))
+        try:
+            expected_profile = build_focused_sandbox_profile(
+                test_executable=self.python_executable,
+                runtime_read_root=expected_runtime_root,
+                workspace=worktree_path,
+                run_parent=run_parent,
+            )
+            expected_command = list(
+                build_focused_sandbox_command(
+                    self.focused_sandbox_executable,
+                    expected_profile,
+                    expected_test_command,
+                )
+            )
+        except (OSError, ValueError):
+            return False
         command = execution.get("command_argv", execution.get("command"))
         if (
             plan.get("id") != report.get("focused_test_plan_id")
             or plan.get("work_item_id") != report.get("item_id")
             or plan.get("executable_path") != str(self.python_executable)
+            or plan.get("sandbox_policy_version")
+            != DARWIN_SANDBOX_POLICY_VERSION
+            or plan.get("sandbox_executable_path")
+            != str(self.focused_sandbox_executable)
+            or plan.get("python_runtime_root") != str(expected_runtime_root)
+            or plan.get("python_runtime_sha256") != expected_runtime_hash
             or plan.get("test_file") != FOCUSED_TEST_FILE
             or plan.get("selector") != FOCUSED_TEST_SELECTOR
             or plan.get("workspace_manifest") != expected_manifest
@@ -1125,6 +1241,16 @@ class RealProofRunner:
             or execution.get("managed_worktree_id")
             != report.get("worktree_id")
             or execution.get("managed_worktree_generation") != 1
+            or execution.get("sandbox_policy_version")
+            != DARWIN_SANDBOX_POLICY_VERSION
+            or execution.get("sandbox_executable_path")
+            != str(self.focused_sandbox_executable)
+            or execution.get("python_runtime_root") != str(expected_runtime_root)
+            or execution.get("python_runtime_sha256") != expected_runtime_hash
+            or execution.get("sandbox_profile") != expected_profile
+            or execution.get("sandbox_profile_sha256")
+            != focused_sandbox_profile_sha256(expected_profile)
+            or execution.get("test_command_argv") != expected_test_command
             or command != expected_command
             or execution.get("cwd") != str(worktree_path)
             or execution.get("status") != "finished"
@@ -1172,6 +1298,10 @@ class RealProofRunner:
                 or metadata.get("execution_id") != execution.get("id")
                 or metadata.get("sha256") != self._sha256(path)
                 or metadata.get("bytes") != file_metadata.st_size
+                or metadata.get("sandbox_policy_version")
+                != DARWIN_SANDBOX_POLICY_VERSION
+                or metadata.get("sandbox_profile_sha256")
+                != focused_sandbox_profile_sha256(expected_profile)
                 or execution.get(prefix + "_path") != str(path.resolve())
                 or execution.get(prefix + "_sha256") != self._sha256(path)
                 or execution.get(prefix + "_bytes") != file_metadata.st_size
@@ -1523,6 +1653,7 @@ class RealProofRunner:
             "git_executable",
             "guardian_executable",
             "python_executable",
+            "focused_sandbox_executable",
         ]
         if self.require_authenticated_provider:
             labels.append("codex_executable")
@@ -1642,6 +1773,7 @@ class RealProofRunner:
             report.get("same_worktree_fixer_tester") is True,
             report.get("scheduler_error_free") is True,
             report.get("focused_test_execution_proof") is True,
+            report.get("focused_test_admission_proof") is True,
             not report.get("resource_leases"),
             report.get("foreign_key_violations") == [],
         )

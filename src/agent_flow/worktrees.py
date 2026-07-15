@@ -21,7 +21,18 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, BinaryIO, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    BinaryIO,
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from agent_flow.process_reconciler import (
     DarwinProcessRuntime,
@@ -216,6 +227,9 @@ class GuardedGitCommandRunner:
         artifact_directory: Path,
         record_process: Callable[[ProcessIdentity, str], None],
         clear_process: Callable[[int, int], None],
+        release_fence: Optional[
+            Callable[[ProcessIdentity, str], ContextManager[None]]
+        ] = None,
         cancellation_event: Optional[threading.Event] = None,
     ) -> GuardedCommandResult:
         if not command or not Path(command[0]).is_absolute():
@@ -307,15 +321,24 @@ class GuardedGitCommandRunner:
         cancelled_before_release = cancelled_before_release or bool(
             cancellation_event is not None and cancellation_event.is_set()
         )
-        if cancelled_before_release:
-            self._close_fd(barrier_write_fd)
-        else:
-            try:
-                os.write(barrier_write_fd, b"1")
-            except BaseException as error:
-                release_error = error
-            finally:
+        try:
+            if cancelled_before_release:
                 self._close_fd(barrier_write_fd)
+            elif release_fence is None:
+                os.write(barrier_write_fd, b"1")
+            else:
+                # The storage transaction remains open across this exact write.
+                # Admission revocation and guardian release therefore have one
+                # durable serialization order instead of a check-then-release gap.
+                with release_fence(identity, str(Path(command[0]).resolve())):
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        cancelled_before_release = True
+                    else:
+                        os.write(barrier_write_fd, b"1")
+        except BaseException as error:
+            release_error = error
+        finally:
+            self._close_fd(barrier_write_fd)
 
         if release_error is not None or cancelled_before_release:
             try:

@@ -171,7 +171,7 @@ def test_schema_v7_migrates_resource_definitions_and_preserves_legacy_lease(
         }
         assert store.foreign_key_violations() == []
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 11
     assert "resource_definitions" in tables
     assert {"lease_slot", "resource_definition_id"}.issubset(lease_columns)
     assert lease["resource_key"] == "legacy:resource"
@@ -232,7 +232,7 @@ def test_schema_v8_migrates_definition_and_lease_integrity_hashes(
         }
         assert store.foreign_key_violations() == []
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 11
     assert resource["identity_hash"] == identity_hash
     assert len(resource["definition_hash"]) == 64
     assert "resource_identity_hash" in lease_columns

@@ -6,7 +6,7 @@ import os
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, ContextManager, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from agent_flow.models import (
     Campaign,
@@ -341,6 +341,27 @@ class SQLiteSchedulerStorage:
         except LeaseConflict:
             return False
         return True
+
+    def focused_test_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        identity: "ProcessIdentity",
+        target_executable: str,
+    ) -> ContextManager[None]:
+        return self.store.focused_test_guardian_release_fence(
+            job_id,
+            worker_id,
+            lease_token,
+            identity.process_id,
+            identity.process_group_id,
+            identity.user_id,
+            identity.executable,
+            identity.start_seconds,
+            identity.start_microseconds,
+            target_executable,
+        )
 
     def clear_external_process(
         self,

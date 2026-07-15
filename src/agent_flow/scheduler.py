@@ -13,7 +13,7 @@ import asyncio
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple, Type, Union
+from typing import Any, ContextManager, Dict, List, Optional, Protocol, Tuple, Type, Union
 
 from pydantic import BaseModel, ValidationError
 
@@ -122,6 +122,16 @@ class Storage(Protocol):
         target_executable: str,
     ) -> bool:
         """Bind a live provider process to the current fenced attempt."""
+
+    def focused_test_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        identity: ProcessIdentity,
+        target_executable: str,
+    ) -> ContextManager[None]:
+        """Serialize focused guardian release against admission revocation."""
 
     def clear_external_process(
         self,
@@ -565,6 +575,13 @@ class Scheduler:
                     slot, job, process_id, process_group_id
                 )
 
+            def focused_test_guardian_release_fence(
+                identity: ProcessIdentity, target_executable: str
+            ) -> ContextManager[None]:
+                return self._focused_test_guardian_release_fence(
+                    slot, job, identity, target_executable
+                )
+
             def record_artifact(
                 kind: str, uri: str, metadata: Mapping[str, Any]
             ) -> None:
@@ -621,6 +638,9 @@ class Scheduler:
                 _external_session_recorder=record_external_session,
                 _external_process_recorder=record_external_process,
                 _external_process_clearer=clear_external_process,
+                _focused_test_guardian_release_fencer=(
+                    focused_test_guardian_release_fence
+                ),
                 _artifact_recorder=record_artifact,
                 _managed_worktree_provider=require_managed_worktree,
                 _managed_worktree_quarantiner=quarantine_managed_worktree,
@@ -765,6 +785,24 @@ class Scheduler:
         )
         if not accepted:
             raise LeaseLost("external process clearing rejected the stale lease fence")
+
+    def _focused_test_guardian_release_fence(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        identity: ProcessIdentity,
+        target_executable: str,
+    ) -> ContextManager[None]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        return self.storage.focused_test_guardian_release_fence(
+            job.id,
+            slot.worker_id,
+            lease_token,
+            identity,
+            target_executable,
+        )
 
     def _record_attempt_artifact(
         self,

@@ -72,6 +72,28 @@ includes:
   new workspace manifest; an attempt/worktree-generation-bound deterministic
   tester, bounded private output, semantic PASS/RED evaluation, and storage-side
   canonical handoff replacement; and
+- schema-v10 immutable macOS Seatbelt execution contracts for those focused
+  plans. Storage binds the root-owned sandbox executable, direct Python
+  interpreter and byte-hashed root-owned runtime, byte-exact deny-default
+  profile, logical test command, wrapped command, and hashes; the worker
+  reconstructs the policy
+  before launch. The policy permits the exact worktree and private scratch,
+  while denying worktree writes, outside same-user file contents and directory
+  listings, networking, forks, other executables, and detached children; and
+- schema-v11 internal focused-test admission precursors for exact pending tester
+  jobs. A durable `fta_...` record binds the campaign configuration, item gates,
+  tester payload, source repository identity and snapshot, managed worktree and
+  generation, every schema-v10 focused-plan authority field, the complete
+  resource set, and exact registered definition hashes. The campaign enters an
+  irreversible focused-test-only mode; storage skips investigator and fixer
+  claims, pins the admission to each tester attempt, and revalidates it at
+  heartbeat, session/process registration, collection, completion, and stage
+  finalization. The exact guardian barrier release occurs while the admission
+  transaction remains open, serializing it against revocation. Revocation or
+  drift fails closed while process clearing remains available for reap. An
+  admitted RED becomes a durable execution blocker because this tester-only
+  mode cannot authorize a fixer. This internal attributed record is not an
+  operator approval workflow and has no public CLI; and
 - an opt-in `prove-real-codex --acknowledge-live-model` command that accepts no
   target paths and proves the authenticated investigator -> managed fixer ->
   authoritative same-worktree focused tester boundary against a fixed
@@ -104,13 +126,24 @@ This slice still does not provide general real-repository campaign execution.
 The three collectors are authoritative only for their supervisor-prepared,
 disposable fixed contracts; arbitrary worker-supplied commands, routes, browser
 actions, SQL, credentials, and target paths remain unauthorized. The focused
-collector is not an authorization boundary for arbitrary repository test code:
-it does not deny same-user filesystem access, network access, or detached child
-processes, and its semantic transcript evaluator is not a trusted general test
-harness. Keep general real campaigns disabled until an OS sandbox or a narrower
-trusted harness proves those controls. Resource registration alone still does
-not authorize launching Chrome, reading an existing browser profile, connecting
-to an application database, starting queues/workers, or mutating a target.
+collector is an authorization boundary only for its immutable supervisor-owned
+macOS `unittest` plan; it does not authorize worker-supplied commands or paths,
+and its exact-selector semantic transcript evaluator is not a general test
+framework. Keep general real campaigns disabled until a separately approved
+admission path binds exact repositories, worktrees, test plans, and registered
+resources without delegating authority to worker output. Resource registration
+alone still does not authorize launching Chrome, reading an existing browser
+profile, connecting to an application database, starting queues/workers, or
+mutating a target.
+The schema-v11 focused-test precursor is intentionally created only after the
+investigator, managed-worktree provisioning, and fixer stages have already
+finished. It therefore does not authorize those earlier launches and must not
+be represented as general campaign admission. A separate pre-launch,
+approval-consuming campaign/repository contract remains required before any
+general real-worker command can be exposed.
+Schema-v11 legacy campaigns cannot prepare an authoritative focused execution
+without an exact admission. Simulation-only Phase 1 campaigns remain available
+under their explicit `allow_simulated_evidence` contract.
 
 ## Architecture Rules
 
@@ -160,6 +193,8 @@ to an application database, starting queues/workers, or mutating a target.
   process-reaping, session, and runtime-artifact boundary.
 - `focused_tests.py`: deterministic execution of storage-prepared focused-test
   plans. It must not derive commands, paths, or environment from worker data.
+- `focused_sandbox.py`: deterministic construction and validation of the exact
+  macOS Seatbelt policy for a storage-prepared focused-test execution.
 - `cli.py`: user-facing commands and status rendering. It must not duplicate
   workflow rules.
 

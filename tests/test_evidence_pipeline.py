@@ -418,7 +418,7 @@ if __name__ == "__main__":
             },
         )
         manifest = store._scan_focused_workspace(Path(worktree["worktree_path"]))
-        store.create_focused_test_plan(
+        focused_plan = store.create_focused_test_plan(
             item["id"],
             executable_path=str(Path(sys.executable).resolve()),
             test_file="test_calculator.py",
@@ -450,6 +450,16 @@ if __name__ == "__main__":
             timeout_seconds=2,
             runtime_root=pipeline_root / "database-runtime",
         )
+        store.create_focused_test_admission(
+            campaign["id"],
+            item["id"],
+            fixed["next_job"]["id"],
+            worktree["id"],
+            focused_plan["id"],
+            [chrome["id"], database["id"]],
+            admitted_by="pipeline-test",
+            reason="authorize the exact fixed three-gate fixture",
+        )
         tester = store.claim_job("tester", "tester-worker", lease_seconds=60)
         assert tester is not None and tester["id"] == fixed["next_job"]["id"]
         context = WorkerContext(
@@ -468,6 +478,20 @@ if __name__ == "__main__":
                 store.clear_external_process(
                     tester["id"], "tester-worker", tester["lease_token"],
                     process_id, process_group_id,
+                )
+            ),
+            _focused_test_guardian_release_fencer=(
+                lambda identity, target: store.focused_test_guardian_release_fence(
+                    tester["id"],
+                    "tester-worker",
+                    tester["lease_token"],
+                    identity.process_id,
+                    identity.process_group_id,
+                    identity.user_id,
+                    identity.executable,
+                    identity.start_seconds,
+                    identity.start_microseconds,
+                    target,
                 )
             ),
             _focused_test_execution_preparer=lambda: (

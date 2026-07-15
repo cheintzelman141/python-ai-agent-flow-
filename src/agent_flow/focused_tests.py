@@ -18,6 +18,16 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Mapping
 
+from agent_flow.focused_sandbox import (
+    DARWIN_SANDBOX_POLICY_VERSION,
+    FocusedSandboxError,
+    build_command as build_focused_sandbox_command,
+    build_profile as build_focused_sandbox_profile,
+    profile_sha256 as focused_sandbox_profile_sha256,
+    python_runtime_root,
+    python_runtime_sha256,
+    sandbox_executable,
+)
 from agent_flow.models import TestHandoff, WorkerRole
 from agent_flow.workers import WorkerContext, WorkerExecutionError, WorkerOutput
 from agent_flow.worktrees import GuardedCommandResult, GuardedGitCommandRunner
@@ -51,6 +61,7 @@ class FocusedTestWorker:
                     "focused_test", identity, target
                 ),
                 clear_process=context.clear_external_process,
+                release_fence=context.focused_test_guardian_release_fence,
                 cancellation_event=cancellation_event,
             )
 
@@ -93,7 +104,6 @@ def _validate_prepared_contract(value: Mapping[str, Any]) -> Dict[str, Any]:
         raise WorkerExecutionError(
             "focused-test command requires an absolute executable and valid arguments"
         )
-
     cwd = _canonical_path(value.get("cwd"), "focused-test cwd")
     _require_private_directory(cwd, private=False)
     artifact_directory = _canonical_path(
@@ -108,6 +118,79 @@ def _validate_prepared_contract(value: Mapping[str, Any]) -> Dict[str, Any]:
             "focused-test runtime artifacts must remain outside the tested workspace"
         )
     _require_private_directory(artifact_directory.parent, private=True)
+
+    sandbox_profile = value.get("sandbox_profile")
+    test_command_value = value.get("test_command_argv")
+    test_file = value.get("test_file")
+    selector = value.get("selector")
+    if (
+        value.get("sandbox_policy_version") != DARWIN_SANDBOX_POLICY_VERSION
+        or not isinstance(sandbox_profile, str)
+        or not sandbox_profile
+        or value.get("sandbox_profile_sha256")
+        != focused_sandbox_profile_sha256(sandbox_profile)
+        or not isinstance(test_command_value, (list, tuple))
+        or not test_command_value
+        or any(
+            not isinstance(argument, str) or not argument
+            for argument in test_command_value
+        )
+        or not isinstance(test_file, str)
+        or not test_file
+        or not isinstance(selector, str)
+        or not selector
+    ):
+        raise WorkerExecutionError(
+            "focused-test preparation omitted its trusted sandbox contract"
+        )
+    test_path = cwd / test_file
+    try:
+        resolved_test_path = test_path.resolve(strict=True)
+        expected_sandbox = sandbox_executable()
+        executable = Path(str(value.get("executable_path"))).resolve(strict=True)
+        runtime_root = python_runtime_root(executable)
+        runtime_hash = python_runtime_sha256(runtime_root)
+        expected_profile = build_focused_sandbox_profile(
+            test_executable=executable,
+            runtime_read_root=runtime_root,
+            workspace=cwd,
+            run_parent=artifact_directory.parent,
+        )
+    except (FocusedSandboxError, OSError, RuntimeError) as error:
+        raise WorkerExecutionError(
+            "focused-test sandbox contract could not be reconstructed"
+        ) from error
+    if (
+        resolved_test_path != test_path
+        or not resolved_test_path.is_file()
+        or not _is_within(resolved_test_path, cwd)
+        or value.get("python_runtime_root") != str(runtime_root)
+        or value.get("python_runtime_sha256") != runtime_hash
+    ):
+        raise WorkerExecutionError(
+            "focused-test authority does not identify its exact trusted test"
+        )
+    expected_test_command = (
+        str(executable),
+        "-I",
+        "-B",
+        str(resolved_test_path),
+        selector,
+        "-v",
+    )
+    expected_command = build_focused_sandbox_command(
+        expected_sandbox, expected_profile, expected_test_command
+    )
+    test_command = tuple(test_command_value)
+    if (
+        test_command != expected_test_command
+        or command != expected_command
+        or sandbox_profile != expected_profile
+        or value.get("sandbox_executable_path") != str(expected_sandbox)
+    ):
+        raise WorkerExecutionError(
+            "focused-test command does not match its trusted sandbox contract"
+        )
 
     environment_value = value.get("environment")
     if not isinstance(environment_value, Mapping):
@@ -173,6 +256,9 @@ def _validate_prepared_contract(value: Mapping[str, Any]) -> Dict[str, Any]:
     return {
         "id": execution_id,
         "command": command,
+        "test_command": test_command,
+        "sandbox_profile": sandbox_profile,
+        "sandbox_policy_version": DARWIN_SANDBOX_POLICY_VERSION,
         "cwd": cwd,
         "environment": environment,
         "artifact_directory": artifact_directory,
@@ -202,12 +288,16 @@ def _private_environment(
     environment_root = artifact_directory.parent / "environment"
     home = environment_root / "home"
     temporary = environment_root / "tmp"
-    if (
-        base_environment.get("HOME") != str(home)
-        or base_environment.get("TMPDIR") != str(temporary)
-    ):
+    expected_environment = {
+        "HOME": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PYTHONHASHSEED": "0",
+        "TMPDIR": str(temporary),
+    }
+    if dict(base_environment) != expected_environment:
         raise WorkerExecutionError(
-            "focused-test environment does not match its persisted private paths"
+            "focused-test environment does not match its exact safe contract"
         )
     if environment_root.exists() or environment_root.is_symlink():
         raise WorkerExecutionError(

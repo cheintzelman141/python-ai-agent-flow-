@@ -27,6 +27,16 @@ from urllib.parse import unquote, urlsplit
 
 from pydantic import ValidationError
 
+from agent_flow.focused_sandbox import (
+    DARWIN_SANDBOX_POLICY_VERSION,
+    build_command as build_focused_sandbox_command,
+    build_profile as build_focused_sandbox_profile,
+    direct_python_executable,
+    profile_sha256 as focused_sandbox_profile_sha256,
+    python_runtime_root,
+    python_runtime_sha256,
+    sandbox_executable,
+)
 from agent_flow.models import (
     EvidenceRef,
     FixHandoff,
@@ -44,7 +54,7 @@ from agent_flow.models import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 OPEN_JOB_STATUSES = ("pending", "running")
 DEFAULT_REQUIRED_GATES = ("focused_tests", "browser", "database")
 DEFAULT_ROLE_LIMITS = {"investigator": 2, "fixer": 2, "tester": 2}
@@ -75,6 +85,8 @@ VALID_WORKSPACE_KINDS = {kind.value for kind in WorkspaceKind}
 WORKTREE_RESOURCE_PREFIX = "git-worktree:"
 RESOURCE_DEFINITION_PREFIX = "res_"
 RESOURCE_DEFINITION_ID_PATTERN = re.compile(r"^res_[0-9a-f]{32}$")
+FOCUSED_TEST_ADMISSION_PREFIX = "fta_"
+FOCUSED_TEST_ADMISSION_ID_PATTERN = re.compile(r"^fta_[0-9a-f]{32}$")
 _OPAQUE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 _COLLECTOR_SECRET_PATTERN = re.compile(
     r"(?i)(?<![A-Za-z0-9])"
@@ -109,6 +121,10 @@ def _id() -> str:
 
 def _resource_id() -> str:
     return RESOURCE_DEFINITION_PREFIX + uuid.uuid4().hex
+
+
+def _focused_test_admission_id() -> str:
+    return FOCUSED_TEST_ADMISSION_PREFIX + uuid.uuid4().hex
 
 
 def _operator_text(value: str, name: str, limit: int) -> str:
@@ -381,6 +397,7 @@ class SQLiteStore:
         "expected_identity_json": "expected_identity",
         "observed_identity_json": "observed_identity",
         "command_argv_json": "command_argv",
+        "test_command_argv_json": "test_command_argv",
         "environment_json": "environment",
         "workspace_manifest_json": "workspace_manifest",
         "workspace_manifest_before_json": "workspace_manifest_before",
@@ -391,6 +408,10 @@ class SQLiteStore:
         "expected_ids_json": "expected_ids",
         "observed_ids_json": "observed_ids",
         "read_only_proof_json": "read_only_proof",
+        "repository_identity_json": "repository_identity",
+        "worktree_identity_json": "worktree_identity",
+        "resource_definition_ids_json": "resource_definition_ids",
+        "resource_bindings_json": "resource_bindings",
     }
 
     def __init__(
@@ -535,6 +556,16 @@ class SQLiteStore:
                     connection.execute(statement)
                 self._migrate_resource_definition_integrity(connection)
                 connection.execute("PRAGMA user_version = 9")
+                version = 9
+            if version == 9:
+                for statement in _SCHEMA_V10:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 10")
+                version = 10
+            if version == 10:
+                for statement in _SCHEMA_V11:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 11")
 
     @staticmethod
     def _migrate_workspace_kinds(connection: sqlite3.Connection) -> None:
@@ -751,6 +782,254 @@ class SQLiteStore:
         if row is None:
             raise NotFoundError("campaign %s not found" % campaign_id)
         return self._row(row)  # type: ignore[return-value]
+
+    @staticmethod
+    def _exact_focused_test_admission_id(admission_id: str) -> str:
+        if (
+            not isinstance(admission_id, str)
+            or FOCUSED_TEST_ADMISSION_ID_PATTERN.fullmatch(admission_id) is None
+        ):
+            raise ValueError(
+                "focused-test admission mutations require an exact fta_<32 hex> ID"
+            )
+        return admission_id
+
+    @staticmethod
+    def _exact_record_id(value: str, label: str) -> str:
+        if (
+            not isinstance(value, str)
+            or value != value.strip()
+            or not value
+            or len(value) > 128
+            or any(
+                unicodedata.category(character) in ("Cc", "Cf")
+                for character in value
+            )
+        ):
+            raise ValueError("%s must be one exact persisted ID" % label)
+        return value
+
+    @staticmethod
+    def _focused_plan_authority(plan: Mapping[str, Any]) -> Dict[str, Any]:
+        return {
+            "id": str(plan["id"]),
+            "work_item_id": str(plan["work_item_id"]),
+            "plan_number": int(plan["plan_number"]),
+            "executable_path": str(plan["executable_path"]),
+            "executable_device": int(plan["executable_device"]),
+            "executable_inode": int(plan["executable_inode"]),
+            "executable_owner_uid": int(plan["executable_owner_uid"]),
+            "executable_mode": int(plan["executable_mode"]),
+            "executable_sha256": str(plan["executable_sha256"]),
+            "sandbox_policy_version": str(plan["sandbox_policy_version"]),
+            "sandbox_executable_path": str(plan["sandbox_executable_path"]),
+            "sandbox_executable_device": int(plan["sandbox_executable_device"]),
+            "sandbox_executable_inode": int(plan["sandbox_executable_inode"]),
+            "sandbox_executable_owner_uid": int(
+                plan["sandbox_executable_owner_uid"]
+            ),
+            "sandbox_executable_mode": int(plan["sandbox_executable_mode"]),
+            "sandbox_executable_sha256": str(plan["sandbox_executable_sha256"]),
+            "python_runtime_root": str(plan["python_runtime_root"]),
+            "python_runtime_sha256": str(plan["python_runtime_sha256"]),
+            "test_file": str(plan["test_file"]),
+            "selector": str(plan["selector"]),
+            "environment": _load(str(plan["environment_json"]), {}),
+            "environment_sha256": str(plan["environment_sha256"]),
+            "workspace_manifest": _load(
+                str(plan["workspace_manifest_json"]), {}
+            ),
+            "workspace_manifest_sha256": str(
+                plan["workspace_manifest_sha256"]
+            ),
+            "runtime_root": str(plan["runtime_root"]),
+            "timeout_seconds": float(plan["timeout_seconds"]),
+            "output_limit_bytes": int(plan["output_limit_bytes"]),
+        }
+
+    @staticmethod
+    def _repository_admission_identity(
+        worktree: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "repository_path": str(worktree["repository_path"]),
+            "source_git_common_dir": str(worktree["source_git_common_dir"]),
+            "source_git_dir": str(worktree["source_git_dir"]),
+            "source_device": int(worktree["source_device"]),
+            "source_inode": int(worktree["source_inode"]),
+            "source_owner_uid": int(worktree["source_owner_uid"]),
+            "object_format": str(worktree["object_format"]),
+            "base_revision": str(worktree["base_revision"]),
+            "base_tree": str(worktree["base_tree"]),
+            "source_snapshot": _load(str(worktree["source_snapshot_json"]), {}),
+        }
+
+    @staticmethod
+    def _worktree_admission_identity(
+        worktree: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        return {
+            "id": str(worktree["id"]),
+            "generation": int(worktree["generation"]),
+            "work_item_id": str(worktree["work_item_id"]),
+            "worktree_path": str(worktree["worktree_path"]),
+            "worktree_git_dir": str(worktree["worktree_git_dir"]),
+            "worktree_device": int(worktree["worktree_device"]),
+            "worktree_inode": int(worktree["worktree_inode"]),
+            "worktree_owner_uid": int(worktree["worktree_owner_uid"]),
+            "branch_ref": str(worktree["branch_ref"]),
+            "base_revision": str(worktree["base_revision"]),
+            "base_tree": str(worktree["base_tree"]),
+        }
+
+    def _focused_test_admission_resource_bindings(
+        self,
+        connection: sqlite3.Connection,
+        campaign_id: str,
+        resource_definition_ids: Sequence[str],
+        *,
+        require_enabled: bool,
+    ) -> List[Dict[str, Any]]:
+        if (
+            isinstance(resource_definition_ids, (str, bytes))
+            or len(resource_definition_ids) > 128
+        ):
+            raise ValueError(
+                "focused-test admission accepts at most 128 exact resource definition IDs"
+            )
+        exact_ids = [
+            self._exact_resource_definition_id(resource_id)
+            for resource_id in resource_definition_ids
+        ]
+        if len(exact_ids) != len(set(exact_ids)):
+            raise ValueError(
+                "focused-test admission resource definition IDs must be unique"
+            )
+        bindings: List[Dict[str, Any]] = []
+        for resource_id in sorted(exact_ids):
+            row = connection.execute(
+                "SELECT * FROM resource_definitions WHERE id = ?",
+                (resource_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError(
+                    "resource definition %s not found" % resource_id
+                )
+            try:
+                definition = self._validated_resource_definition_row(row)
+            except StorageError as error:
+                raise TransitionConflict(
+                    "resource definition %s failed integrity validation"
+                    % resource_id
+                ) from error
+            if require_enabled and not bool(definition["enabled"]):
+                raise TransitionConflict(
+                    "resource definition %s is disabled" % resource_id
+                )
+            if definition["campaign_id"] not in (None, campaign_id):
+                raise TransitionConflict(
+                    "resource definition %s is outside the campaign scope"
+                    % resource_id
+                )
+            bindings.append(
+                {
+                    "id": resource_id,
+                    "kind": str(definition["kind"]),
+                    "campaign_id": definition["campaign_id"],
+                    "identity_hash": str(definition["identity_hash"]),
+                    "definition_hash": str(definition["definition_hash"]),
+                    "policy": definition["policy"],
+                }
+            )
+        return bindings
+
+    @staticmethod
+    def _focused_test_admission_authority(
+        admission: Mapping[str, Any]
+    ) -> Dict[str, Any]:
+        fields = (
+            "id",
+            "campaign_id",
+            "work_item_id",
+            "tester_job_id",
+            "managed_worktree_id",
+            "managed_worktree_generation",
+            "focused_test_plan_id",
+            "focused_test_plan_sha256",
+            "campaign_config_sha256",
+            "job_payload_sha256",
+            "required_gates_sha256",
+            "repository_identity",
+            "repository_identity_sha256",
+            "worktree_identity",
+            "worktree_identity_sha256",
+            "resource_definition_ids",
+            "resource_bindings",
+            "resource_bindings_sha256",
+            "required_resources_sha256",
+            "admitted_by",
+            "admission_reason",
+            "admitted_at",
+        )
+        return {field: admission[field] for field in fields}
+
+    def _focused_test_admission_record(
+        self, row: sqlite3.Row
+    ) -> Dict[str, Any]:
+        try:
+            record = self._row(row)
+            if record is None:
+                raise ValueError("admission record is absent")
+            self._exact_focused_test_admission_id(str(record["id"]))
+            resource_ids = record["resource_definition_ids"]
+            bindings = record["resource_bindings"]
+            if (
+                not isinstance(resource_ids, list)
+                or not isinstance(bindings, list)
+                or any(not isinstance(binding, Mapping) for binding in bindings)
+                or resource_ids != sorted(resource_ids)
+                or len(resource_ids) != len(set(resource_ids))
+                or [binding.get("id") for binding in bindings] != resource_ids
+            ):
+                raise ValueError("resource bindings are not canonical")
+            for field in ("repository_identity", "worktree_identity"):
+                if not isinstance(record[field], dict):
+                    raise ValueError("admission identity is not an object")
+            expected_hashes = {
+                "focused_test_plan_sha256": str(
+                    record["focused_test_plan_sha256"]
+                ),
+                "campaign_config_sha256": str(record["campaign_config_sha256"]),
+                "job_payload_sha256": str(record["job_payload_sha256"]),
+                "required_gates_sha256": str(record["required_gates_sha256"]),
+                "repository_identity_sha256": _sha256_json(
+                    record["repository_identity"]
+                ),
+                "worktree_identity_sha256": _sha256_json(
+                    record["worktree_identity"]
+                ),
+                "resource_bindings_sha256": hashlib.sha256(
+                    _dump(bindings).encode("utf-8")
+                ).hexdigest(),
+                "required_resources_sha256": str(
+                    record["required_resources_sha256"]
+                ),
+            }
+            for field, expected in expected_hashes.items():
+                value = str(record[field])
+                if _SHA256_PATTERN.fullmatch(value) is None or value != expected:
+                    raise ValueError("%s changed" % field)
+            authority_hash = _sha256_json(
+                self._focused_test_admission_authority(record)
+            )
+            if authority_hash != record["authority_sha256"]:
+                raise ValueError("authority hash changed")
+        except (KeyError, TypeError, ValueError) as error:
+            raise StorageError(
+                "persisted focused-test admission %s is malformed or changed"
+                % row["id"]
+            ) from error
+        return record
 
     @staticmethod
     def _exact_resource_definition_id(resource_id: str) -> str:
@@ -2819,6 +3098,571 @@ class SQLiteStore:
                 ),
             }
 
+    @staticmethod
+    def _assert_admission_directory_identity(
+        path_value: str,
+        *,
+        device: int,
+        inode: int,
+        owner_uid: int,
+        label: str,
+    ) -> None:
+        path = Path(path_value)
+        try:
+            resolved = path.resolve(strict=True)
+            details = path.lstat()
+        except OSError as error:
+            raise LeaseConflict("%s is absent" % label) from error
+        if (
+            resolved != path
+            or not stat.S_ISDIR(details.st_mode)
+            or int(details.st_dev) != device
+            or int(details.st_ino) != inode
+            or int(details.st_uid) != owner_uid
+        ):
+            raise LeaseConflict("%s identity changed" % label)
+
+    def _validate_live_focused_test_admission(
+        self,
+        connection: sqlite3.Connection,
+        admission_row: sqlite3.Row,
+        job: sqlite3.Row,
+    ) -> Dict[str, Any]:
+        try:
+            admission = self._focused_test_admission_record(admission_row)
+        except StorageError as error:
+            raise LeaseConflict("focused-test admission integrity changed") from error
+        if admission["status"] != "active":
+            raise LeaseConflict("focused-test admission is not active")
+        if (
+            admission["campaign_id"] != job["campaign_id"]
+            or admission["work_item_id"] != job["work_item_id"]
+            or admission["tester_job_id"] != job["id"]
+            or job["role"] != "tester"
+            or job["workspace_kind"] != WorkspaceKind.MANAGED_WORKTREE.value
+            or admission["managed_worktree_id"] != job["managed_worktree_id"]
+        ):
+            raise LeaseConflict("focused-test admission does not match the exact tester job")
+
+        campaign = connection.execute(
+            "SELECT * FROM campaigns WHERE id = ?",
+            (job["campaign_id"],),
+        ).fetchone()
+        item = connection.execute(
+            "SELECT * FROM work_items WHERE id = ? AND campaign_id = ?",
+            (job["work_item_id"], job["campaign_id"]),
+        ).fetchone()
+        worktree = connection.execute(
+            """SELECT * FROM managed_worktrees
+               WHERE id = ? AND campaign_id = ? AND work_item_id = ?""",
+            (
+                admission["managed_worktree_id"],
+                job["campaign_id"],
+                job["work_item_id"],
+            ),
+        ).fetchone()
+        plan = connection.execute(
+            """SELECT * FROM focused_test_plans
+               WHERE id = ? AND work_item_id = ?""",
+            (admission["focused_test_plan_id"], job["work_item_id"]),
+        ).fetchone()
+        latest_plan = connection.execute(
+            """SELECT id FROM focused_test_plans WHERE work_item_id = ?
+               ORDER BY plan_number DESC LIMIT 1""",
+            (job["work_item_id"],),
+        ).fetchone()
+        if (
+            campaign is None
+            or campaign["status"] != "active"
+            or campaign["execution_mode"] != "focused_test_admission"
+            or item is None
+            or worktree is None
+            or worktree["state"] != "ready"
+            or plan is None
+            or latest_plan is None
+            or latest_plan["id"] != plan["id"]
+        ):
+            raise LeaseConflict("focused-test admission authority is absent or no longer current")
+
+        campaign_config = _load(campaign["config_json"], {})
+        required_gates = _load(item["required_gates_json"], [])
+        job_payload = _load(job["payload_json"], {})
+        if required_gates not in (
+            [GateKind.FOCUSED_TESTS.value],
+            list(DEFAULT_REQUIRED_GATES),
+        ):
+            raise LeaseConflict(
+                "focused-test admission supports only the trusted focused-test "
+                "gate or fixed three-gate pipeline"
+            )
+        if (
+            _sha256_json(campaign_config) != admission["campaign_config_sha256"]
+            or hashlib.sha256(_dump(job_payload).encode("utf-8")).hexdigest()
+            != admission["job_payload_sha256"]
+            or hashlib.sha256(_dump(required_gates).encode("utf-8")).hexdigest()
+            != admission["required_gates_sha256"]
+        ):
+            raise LeaseConflict("campaign, item, or tester payload authority changed")
+
+        repository_identity = self._repository_admission_identity(worktree)
+        worktree_identity = self._worktree_admission_identity(worktree)
+        if (
+            repository_identity != admission["repository_identity"]
+            or worktree_identity != admission["worktree_identity"]
+            or int(worktree["generation"])
+            != int(admission["managed_worktree_generation"])
+            or str(worktree["repository_path"])
+            not in _canonical_repository_scope(campaign_config)
+        ):
+            raise LeaseConflict("campaign repository or worktree authority changed")
+        self._assert_admission_directory_identity(
+            str(worktree["repository_path"]),
+            device=int(worktree["source_device"]),
+            inode=int(worktree["source_inode"]),
+            owner_uid=int(worktree["source_owner_uid"]),
+            label="admitted source repository",
+        )
+        self._assert_admission_directory_identity(
+            str(worktree["worktree_path"]),
+            device=int(worktree["worktree_device"]),
+            inode=int(worktree["worktree_inode"]),
+            owner_uid=int(worktree["worktree_owner_uid"]),
+            label="admitted managed worktree",
+        )
+
+        try:
+            plan_hash = _sha256_json(self._focused_plan_authority(plan))
+        except (KeyError, TypeError, ValueError) as error:
+            raise LeaseConflict("focused test plan authority is incomplete") from error
+        if (
+            plan_hash != admission["focused_test_plan_sha256"]
+            or plan["sandbox_policy_version"] != DARWIN_SANDBOX_POLICY_VERSION
+        ):
+            raise LeaseConflict("focused test plan authority changed")
+
+        try:
+            bindings = self._focused_test_admission_resource_bindings(
+                connection,
+                str(job["campaign_id"]),
+                admission["resource_definition_ids"],
+                require_enabled=True,
+            )
+        except (NotFoundError, StorageError, TransitionConflict, ValueError) as error:
+            raise LeaseConflict(
+                "focused-test admission resource authority is unavailable"
+            ) from error
+        expected_resources = sorted(
+            list(admission["resource_definition_ids"])
+            + [WORKTREE_RESOURCE_PREFIX + str(worktree["id"])]
+        )
+        if (
+            bindings != admission["resource_bindings"]
+            or _load(job["required_resources_json"], []) != expected_resources
+            or hashlib.sha256(
+                _dump(expected_resources).encode("utf-8")
+            ).hexdigest()
+            != admission["required_resources_sha256"]
+        ):
+            raise LeaseConflict("focused-test admission resource authority changed")
+        return admission
+
+    def _assert_live_focused_test_admission(
+        self,
+        connection: sqlite3.Connection,
+        admission_row: sqlite3.Row,
+        job: sqlite3.Row,
+    ) -> Dict[str, Any]:
+        try:
+            return self._validate_live_focused_test_admission(
+                connection, admission_row, job
+            )
+        except LeaseConflict:
+            raise
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise LeaseConflict(
+                "focused-test admission live authority is malformed"
+            ) from error
+
+    def _assert_attempt_focused_test_admission(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+    ) -> Optional[Dict[str, Any]]:
+        attempt = connection.execute(
+            """SELECT focused_test_admission_id FROM attempts
+               WHERE id = ? AND job_id = ? AND status = 'running'""",
+            (job["current_attempt_id"], job["id"]),
+        ).fetchone()
+        if attempt is None:
+            raise LeaseConflict("current running attempt is absent")
+        admission_id = attempt["focused_test_admission_id"]
+        campaign = connection.execute(
+            "SELECT execution_mode FROM campaigns WHERE id = ?",
+            (job["campaign_id"],),
+        ).fetchone()
+        if campaign is None:
+            raise LeaseConflict("attempt campaign disappeared")
+        if admission_id is None:
+            if campaign["execution_mode"] == "focused_test_admission":
+                raise LeaseConflict(
+                    "focused-test campaign attempt has no pinned admission"
+                )
+            return None
+        if campaign["execution_mode"] != "focused_test_admission":
+            raise LeaseConflict(
+                "focused-test admission is outside its persisted campaign mode"
+            )
+        admission_row = connection.execute(
+            "SELECT * FROM focused_test_admissions WHERE id = ?",
+            (admission_id,),
+        ).fetchone()
+        if admission_row is None:
+            raise LeaseConflict("attempt focused-test admission disappeared")
+        admission = self._assert_live_focused_test_admission(
+            connection, admission_row, job
+        )
+        if admission["id"] != admission_id:
+            raise LeaseConflict("attempt focused-test admission identity changed")
+        return admission
+
+    def create_focused_test_admission(
+        self,
+        campaign_id: str,
+        work_item_id: str,
+        tester_job_id: str,
+        managed_worktree_id: str,
+        focused_test_plan_id: str,
+        resource_definition_ids: Sequence[str],
+        *,
+        admitted_by: str,
+        reason: str,
+        admission_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Bind one internally attributed tester job to exact immutable authority.
+
+        This precursor records an actor and reason for audit.  It is not an
+        operator-approval workflow and is intentionally not exposed by the CLI.
+        """
+
+        for value, label in (
+            (campaign_id, "campaign ID"),
+            (work_item_id, "work item ID"),
+            (tester_job_id, "tester job ID"),
+            (managed_worktree_id, "managed worktree ID"),
+            (focused_test_plan_id, "focused test plan ID"),
+        ):
+            self._exact_record_id(value, label)
+        admitted_by = _operator_text(admitted_by, "focused-test admission actor", 256)
+        reason = _operator_text(reason, "focused-test admission reason", 1024)
+        admission_id = (
+            _focused_test_admission_id()
+            if admission_id is None
+            else self._exact_focused_test_admission_id(admission_id)
+        )
+        with self._transaction() as connection:
+            now = self._clock()
+            campaign = connection.execute(
+                "SELECT * FROM campaigns WHERE id = ?", (campaign_id,)
+            ).fetchone()
+            item = connection.execute(
+                """SELECT * FROM work_items
+                   WHERE id = ? AND campaign_id = ?""",
+                (work_item_id, campaign_id),
+            ).fetchone()
+            job = connection.execute(
+                """SELECT * FROM jobs
+                   WHERE id = ? AND campaign_id = ? AND work_item_id = ?""",
+                (tester_job_id, campaign_id, work_item_id),
+            ).fetchone()
+            worktree = connection.execute(
+                """SELECT * FROM managed_worktrees
+                   WHERE id = ? AND campaign_id = ? AND work_item_id = ?""",
+                (managed_worktree_id, campaign_id, work_item_id),
+            ).fetchone()
+            plan = connection.execute(
+                """SELECT * FROM focused_test_plans
+                   WHERE id = ? AND work_item_id = ?""",
+                (focused_test_plan_id, work_item_id),
+            ).fetchone()
+            latest_plan = connection.execute(
+                """SELECT id FROM focused_test_plans WHERE work_item_id = ?
+                   ORDER BY plan_number DESC LIMIT 1""",
+                (work_item_id,),
+            ).fetchone()
+            if campaign is None:
+                raise NotFoundError("campaign %s not found" % campaign_id)
+            if item is None:
+                raise NotFoundError("work item is outside the requested campaign")
+            if job is None:
+                raise NotFoundError("tester job is outside the requested work item")
+            if worktree is None:
+                raise NotFoundError("managed worktree is outside the requested work item")
+            if plan is None:
+                raise NotFoundError("focused test plan is outside the requested work item")
+            if campaign["status"] != "active" or item["state"] != "ready_for_test":
+                raise TransitionConflict(
+                    "focused-test admission requires an active ready-for-test item"
+                )
+            if (
+                job["role"] != "tester"
+                or job["status"] != "pending"
+                or job["queued_item_state"] != "ready_for_test"
+                or job["active_item_state"] != "testing"
+                or job["workspace_kind"] != WorkspaceKind.MANAGED_WORKTREE.value
+                or job["managed_worktree_id"] != managed_worktree_id
+            ):
+                raise TransitionConflict(
+                    "focused-test admission requires the exact pending managed-worktree tester job"
+                )
+            if (
+                worktree["state"] != "ready"
+                or latest_plan is None
+                or latest_plan["id"] != focused_test_plan_id
+                or plan["sandbox_policy_version"] != DARWIN_SANDBOX_POLICY_VERSION
+            ):
+                raise TransitionConflict(
+                    "focused-test admission requires the latest trusted focused-test plan and ready worktree"
+                )
+            campaign_config = _load(campaign["config_json"], {})
+            required_gates = _load(item["required_gates_json"], [])
+            if required_gates not in (
+                [GateKind.FOCUSED_TESTS.value],
+                list(DEFAULT_REQUIRED_GATES),
+            ):
+                raise TransitionConflict(
+                    "focused-test admission permits only the focused-test gate "
+                    "or fixed three-gate pipeline"
+                )
+            if str(worktree["repository_path"]) not in _canonical_repository_scope(
+                campaign_config
+            ):
+                raise TransitionConflict(
+                    "managed worktree repository is outside the campaign scope"
+                )
+            bindings = self._focused_test_admission_resource_bindings(
+                connection,
+                campaign_id,
+                resource_definition_ids,
+                require_enabled=True,
+            )
+            exact_resource_ids = [binding["id"] for binding in bindings]
+            repository_identity = self._repository_admission_identity(worktree)
+            worktree_identity = self._worktree_admission_identity(worktree)
+            focused_plan_hash = _sha256_json(
+                self._focused_plan_authority(plan)
+            )
+            required_resources = sorted(
+                exact_resource_ids
+                + [WORKTREE_RESOURCE_PREFIX + managed_worktree_id]
+            )
+            if _load(job["required_resources_json"], []) != required_resources:
+                raise TransitionConflict(
+                    "tester job resources must exactly match the requested admission"
+                )
+            data: Dict[str, Any] = {
+                "id": admission_id,
+                "campaign_id": campaign_id,
+                "work_item_id": work_item_id,
+                "tester_job_id": tester_job_id,
+                "managed_worktree_id": managed_worktree_id,
+                "managed_worktree_generation": int(worktree["generation"]),
+                "focused_test_plan_id": focused_test_plan_id,
+                "focused_test_plan_sha256": focused_plan_hash,
+                "campaign_config_sha256": _sha256_json(campaign_config),
+                "job_payload_sha256": hashlib.sha256(
+                    str(job["payload_json"]).encode("utf-8")
+                ).hexdigest(),
+                "required_gates_sha256": hashlib.sha256(
+                    str(item["required_gates_json"]).encode("utf-8")
+                ).hexdigest(),
+                "repository_identity": repository_identity,
+                "repository_identity_sha256": _sha256_json(repository_identity),
+                "worktree_identity": worktree_identity,
+                "worktree_identity_sha256": _sha256_json(worktree_identity),
+                "resource_definition_ids": exact_resource_ids,
+                "resource_bindings": bindings,
+                "resource_bindings_sha256": hashlib.sha256(
+                    _dump(bindings).encode("utf-8")
+                ).hexdigest(),
+                "required_resources_sha256": hashlib.sha256(
+                    _dump(required_resources).encode("utf-8")
+                ).hexdigest(),
+                "admitted_by": admitted_by,
+                "admission_reason": reason,
+                "admitted_at": now,
+            }
+            data["authority_sha256"] = _sha256_json(
+                self._focused_test_admission_authority(data)
+            )
+            changed = connection.execute(
+                """UPDATE campaigns
+                   SET execution_mode = 'focused_test_admission', updated_at = ?
+                   WHERE id = ?
+                     AND execution_mode IN ('legacy', 'focused_test_admission')""",
+                (now, campaign_id),
+            ).rowcount
+            if changed != 1:
+                raise TransitionConflict(
+                    "campaign execution mode cannot accept focused admission"
+                )
+            try:
+                connection.execute(
+                    """INSERT INTO focused_test_admissions
+                       (id, campaign_id, work_item_id, tester_job_id,
+                        managed_worktree_id, managed_worktree_generation,
+                        focused_test_plan_id, focused_test_plan_sha256,
+                        campaign_config_sha256, job_payload_sha256,
+                        required_gates_sha256, repository_identity_json,
+                        repository_identity_sha256, worktree_identity_json,
+                        worktree_identity_sha256, resource_definition_ids_json,
+                        resource_bindings_json, resource_bindings_sha256,
+                        required_resources_sha256,
+                        authority_sha256, status, admitted_by, admission_reason,
+                        admitted_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+                    (
+                        admission_id,
+                        campaign_id,
+                        work_item_id,
+                        tester_job_id,
+                        managed_worktree_id,
+                        int(worktree["generation"]),
+                        focused_test_plan_id,
+                        focused_plan_hash,
+                        data["campaign_config_sha256"],
+                        data["job_payload_sha256"],
+                        data["required_gates_sha256"],
+                        _dump(repository_identity),
+                        data["repository_identity_sha256"],
+                        _dump(worktree_identity),
+                        data["worktree_identity_sha256"],
+                        _dump(exact_resource_ids),
+                        _dump(bindings),
+                        data["resource_bindings_sha256"],
+                        data["required_resources_sha256"],
+                        data["authority_sha256"],
+                        admitted_by,
+                        reason,
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise TransitionConflict(
+                    "tester job already has an active focused-test admission"
+                ) from error
+            self._append_event(
+                connection,
+                "focused_test.admission_created",
+                campaign_id=campaign_id,
+                work_item_id=work_item_id,
+                job_id=tester_job_id,
+                actor=admitted_by,
+                event_data={
+                    "admission_id": admission_id,
+                    "managed_worktree_id": managed_worktree_id,
+                    "managed_worktree_generation": int(worktree["generation"]),
+                    "focused_test_plan_id": focused_test_plan_id,
+                    "resource_definition_ids": exact_resource_ids,
+                    "authority_sha256": data["authority_sha256"],
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+            inserted = connection.execute(
+                "SELECT * FROM focused_test_admissions WHERE id = ?",
+                (admission_id,),
+            ).fetchone()
+            assert inserted is not None
+            self._assert_live_focused_test_admission(
+                connection, inserted, job
+            )
+        return self.get_focused_test_admission(admission_id)
+
+    def get_focused_test_admission(self, admission_id: str) -> Dict[str, Any]:
+        admission_id = self._exact_focused_test_admission_id(admission_id)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM focused_test_admissions WHERE id = ?",
+                (admission_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("focused-test admission %s not found" % admission_id)
+        return self._focused_test_admission_record(row)
+
+    def list_focused_test_admissions(
+        self,
+        *,
+        campaign_id: Optional[str] = None,
+        work_item_id: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        parameters: List[Any] = []
+        for column, value in (
+            ("campaign_id", campaign_id),
+            ("work_item_id", work_item_id),
+            ("status", status),
+        ):
+            if value is not None:
+                clauses.append(column + " = ?")
+                parameters.append(value)
+        sql = "SELECT * FROM focused_test_admissions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY admitted_at, id"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return [self._focused_test_admission_record(row) for row in rows]
+
+    def revoke_focused_test_admission(
+        self,
+        admission_id: str,
+        *,
+        revoked_by: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        admission_id = self._exact_focused_test_admission_id(admission_id)
+        revoked_by = _operator_text(revoked_by, "campaign revocation actor", 256)
+        reason = _operator_text(reason, "campaign revocation reason", 1024)
+        with self._transaction() as connection:
+            row = connection.execute(
+                "SELECT * FROM focused_test_admissions WHERE id = ?",
+                (admission_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("focused-test admission %s not found" % admission_id)
+            admission = self._focused_test_admission_record(row)
+            if admission["status"] == "revoked":
+                return admission
+            now = self._clock()
+            changed = connection.execute(
+                """UPDATE focused_test_admissions
+                   SET status = 'revoked', revoked_by = ?, revocation_reason = ?,
+                       revoked_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'active'""",
+                (revoked_by, reason, now, now, admission_id),
+            ).rowcount
+            if changed != 1:
+                raise TransitionConflict(
+                    "focused-test admission changed during revocation"
+                )
+            self._append_event(
+                connection,
+                "focused_test.admission_revoked",
+                campaign_id=str(admission["campaign_id"]),
+                work_item_id=str(admission["work_item_id"]),
+                job_id=str(admission["tester_job_id"]),
+                actor=revoked_by,
+                event_data={
+                    "admission_id": admission_id,
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+        return self.get_focused_test_admission(admission_id)
+
     def list_campaigns(self) -> List[Dict[str, Any]]:
         with self._lock:
             rows = self._connection.execute(
@@ -3170,13 +4014,17 @@ class SQLiteStore:
         with self._transaction() as connection:
             now = self._clock()
             item = connection.execute(
-                """SELECT i.*, c.config_json
+                """SELECT i.*, c.config_json, c.execution_mode
                    FROM work_items i JOIN campaigns c ON c.id = i.campaign_id
                    WHERE i.id = ? AND i.campaign_id = ?""",
                 (work_item_id, campaign_id),
             ).fetchone()
             if item is None:
                 raise NotFoundError("work item is absent from the requested campaign")
+            if item["execution_mode"] == "focused_test_admission":
+                raise TransitionConflict(
+                    "focused-test-only campaign mode cannot provision another worktree"
+                )
             if item["state"] != "ready_for_fix":
                 raise TransitionConflict(
                     "managed worktrees can be requested only for ready-for-fix items"
@@ -4725,6 +5573,7 @@ class SQLiteStore:
             self._recover_expired(connection, now)
             candidates = connection.execute(
                 """SELECT j.*, c.global_limit, c.role_limits_json,
+                          c.execution_mode,
                           c.config_json AS campaign_config_json
                    FROM jobs j JOIN campaigns c ON c.id = j.campaign_id
                    JOIN work_items i ON i.id = j.work_item_id
@@ -4734,6 +5583,24 @@ class SQLiteStore:
                 (role, now),
             ).fetchall()
             for job in candidates:
+                admission_row: Optional[sqlite3.Row] = None
+                if job["execution_mode"] == "focused_test_admission":
+                    if role != "tester":
+                        continue
+                    admission_row = connection.execute(
+                        """SELECT * FROM focused_test_admissions
+                           WHERE tester_job_id = ? AND status = 'active'
+                           ORDER BY admitted_at DESC, id DESC LIMIT 1""",
+                        (job["id"],),
+                    ).fetchone()
+                    if admission_row is None:
+                        continue
+                    try:
+                        self._assert_live_focused_test_admission(
+                            connection, admission_row, job
+                        )
+                    except LeaseConflict:
+                        continue
                 campaign_config = _load(job["campaign_config_json"], {})
                 workspace_kind = str(job["workspace_kind"])
                 managed_worktree: Optional[sqlite3.Row] = None
@@ -4833,8 +5700,9 @@ class SQLiteStore:
                     """INSERT INTO attempts
                        (id, job_id, attempt_number, worker_id, lease_token, status,
                         managed_worktree_id, managed_worktree_generation,
-                        started_at, heartbeat_at, lease_expires_at)
-                       VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?)""",
+                        focused_test_admission_id, started_at, heartbeat_at,
+                        lease_expires_at)
+                       VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?, ?, ?, ?)""",
                     (
                         attempt_id,
                         job["id"],
@@ -4847,6 +5715,7 @@ class SQLiteStore:
                             if managed_worktree is None
                             else managed_worktree["generation"]
                         ),
+                        None if admission_row is None else admission_row["id"],
                         now,
                         now,
                         expires_at,
@@ -4881,6 +5750,9 @@ class SQLiteStore:
                     work_item_id=job["work_item_id"], job_id=job["id"], actor=worker_id,
                     event_data={"attempt_id": attempt_id, "attempt_number": attempt_number,
                                 "lease_token": token, "resources": resources,
+                                "focused_test_admission_id": (
+                                    None if admission_row is None else admission_row["id"]
+                                ),
                                 "from_state": job["queued_item_state"],
                                 "to_state": job["active_item_state"]}, created_at=now
                 )
@@ -5010,6 +5882,7 @@ class SQLiteStore:
             now = self._clock()
             expires_at = now + lease_seconds
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            self._assert_attempt_focused_test_admission(connection, job)
             self._assert_registered_resource_fences(connection, job, now)
             connection.execute(
                 """UPDATE jobs
@@ -5455,6 +6328,7 @@ class SQLiteStore:
             job = self._assert_live_lease(
                 connection, job_id, worker_id, lease_token, now
             )
+            self._assert_attempt_focused_test_admission(connection, job)
             attempt = connection.execute(
                 "SELECT * FROM attempts WHERE id = ?",
                 (job["current_attempt_id"],),
@@ -5623,6 +6497,7 @@ class SQLiteStore:
             job = self._assert_live_lease(
                 connection, job_id, worker_id, lease_token, now
             )
+            self._assert_attempt_focused_test_admission(connection, job)
             attempt = connection.execute(
                 "SELECT * FROM attempts WHERE id = ?",
                 (job["current_attempt_id"],),
@@ -5731,6 +6606,84 @@ class SQLiteStore:
                 (process_id_record,),
             ).fetchone()
             return self._row(recorded)  # type: ignore[return-value]
+
+    @contextmanager
+    def focused_test_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        process_id: int,
+        process_group_id: int,
+        owner_uid: int,
+        kernel_executable: str,
+        start_seconds: int,
+        start_microseconds: int,
+        target_executable: str,
+    ) -> Iterator[None]:
+        """Serialize the exact focused guardian release against revocation.
+
+        The caller writes the guardian barrier while this transaction remains
+        open. A revocation transaction therefore either commits first and
+        denies release, or commits after the already-authorized release. There
+        is no check-then-release interval in which revocation can be lost.
+        """
+
+        with self._transaction() as connection:
+            now = self._clock()
+            job = self._assert_live_lease(
+                connection, job_id, worker_id, lease_token, now
+            )
+            admission = self._assert_attempt_focused_test_admission(
+                connection, job
+            )
+            if admission is None:
+                raise LeaseConflict(
+                    "focused-test guardian release requires an exact admission"
+                )
+            execution = connection.execute(
+                """SELECT * FROM focused_test_executions
+                   WHERE attempt_id = ? AND job_id = ? AND status = 'prepared'""",
+                (job["current_attempt_id"], job["id"]),
+            ).fetchone()
+            external = connection.execute(
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND job_id = ? AND provider = 'focused_test'
+                     AND state = 'active'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (job["current_attempt_id"], job["id"]),
+            ).fetchone()
+            if execution is None or external is None:
+                raise LeaseConflict(
+                    "focused-test guardian release lacks prepared execution and process authority"
+                )
+            expected_process = (
+                int(process_id),
+                int(process_group_id),
+                int(owner_uid),
+                str(kernel_executable),
+                int(start_seconds),
+                int(start_microseconds),
+                str(target_executable),
+            )
+            persisted_process = (
+                int(external["process_id"]),
+                int(external["process_group_id"]),
+                int(external["owner_uid"]),
+                str(external["kernel_executable"]),
+                int(external["start_seconds"]),
+                int(external["start_microseconds"]),
+                str(external["target_executable"]),
+            )
+            if (
+                expected_process != persisted_process
+                or process_id != process_group_id
+                or target_executable != execution["sandbox_executable_path"]
+            ):
+                raise LeaseConflict(
+                    "focused-test guardian release process identity changed"
+                )
+            yield
 
     def clear_external_process(
         self,
@@ -5950,18 +6903,47 @@ class SQLiteStore:
         if not supplied.is_absolute():
             raise ValueError("focused Python executable must be an absolute path")
         try:
-            resolved = supplied.resolve(strict=True)
+            supplied_resolved = supplied.resolve(strict=True)
         except FileNotFoundError as error:
             raise ValueError("focused Python executable does not exist") from error
-        if str(supplied) != str(resolved):
+        if str(supplied) != str(supplied_resolved):
             raise ValueError("focused Python executable must already be fully resolved")
+        resolved = direct_python_executable(supplied_resolved)
         details = resolved.lstat()
-        if not stat.S_ISREG(details.st_mode) or details.st_nlink < 1:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink < 1
+            or not os.access(str(resolved), os.X_OK)
+        ):
             raise ValueError("focused Python executable must be a regular file")
         if details.st_mode & 0o022:
             raise ValueError("focused Python executable cannot be group/world writable")
         if _PYTHON_EXECUTABLE_PATTERN.fullmatch(resolved.name) is None:
             raise ValueError("focused executable must be a resolved Python interpreter")
+        return {
+            "path": str(resolved),
+            "device": int(details.st_dev),
+            "inode": int(details.st_ino),
+            "owner_uid": int(details.st_uid),
+            "mode": int(details.st_mode),
+            "sha256": SQLiteStore._hash_file(resolved, details),
+        }
+
+    @staticmethod
+    def _focused_sandbox_executable_identity(
+        executable_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        resolved = sandbox_executable()
+        if executable_path is not None and executable_path != str(resolved):
+            raise ValueError("focused Seatbelt executable path changed")
+        details = resolved.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != 0
+            or details.st_mode & 0o022
+            or not os.access(str(resolved), os.X_OK)
+        ):
+            raise ValueError("focused Seatbelt executable identity is unsafe")
         return {
             "path": str(resolved),
             "device": int(details.st_dev),
@@ -6109,6 +7091,17 @@ class SQLiteStore:
         ):
             raise ValueError("focused output limit must be between 1024 and 16777216 bytes")
         executable = self._focused_executable_identity(executable_path)
+        sandbox = self._focused_sandbox_executable_identity()
+        interpreter_root = python_runtime_root(Path(str(executable["path"])))
+        interpreter_root_hash = python_runtime_sha256(interpreter_root)
+        interpreter_root_details = interpreter_root.lstat()
+        if (
+            not stat.S_ISDIR(interpreter_root_details.st_mode)
+            or interpreter_root_details.st_mode & 0o022
+        ):
+            raise ValueError(
+                "focused Python runtime root cannot be group/world writable"
+            )
         base_environment = self._focused_environment(environment)
         supplied_runtime_root = Path(runtime_root).expanduser()
         if not supplied_runtime_root.is_absolute():
@@ -6166,6 +7159,15 @@ class SQLiteStore:
                     "executable_owner_uid": executable["owner_uid"],
                     "executable_mode": executable["mode"],
                     "executable_sha256": executable["sha256"],
+                    "sandbox_policy_version": DARWIN_SANDBOX_POLICY_VERSION,
+                    "sandbox_executable_path": sandbox["path"],
+                    "sandbox_executable_device": sandbox["device"],
+                    "sandbox_executable_inode": sandbox["inode"],
+                    "sandbox_executable_owner_uid": sandbox["owner_uid"],
+                    "sandbox_executable_mode": sandbox["mode"],
+                    "sandbox_executable_sha256": sandbox["sha256"],
+                    "python_runtime_root": str(interpreter_root),
+                    "python_runtime_sha256": interpreter_root_hash,
                     "test_file": test_file,
                     "selector": selector,
                     "environment_json": _dump(base_environment),
@@ -6178,6 +7180,14 @@ class SQLiteStore:
                     name
                     for name, value in immutable_authority.items()
                     if previous_plan[name] != value
+                    and not (
+                        previous_plan["sandbox_policy_version"] is None
+                        and (
+                            name.startswith("executable_")
+                            or name.startswith("sandbox_")
+                            or name.startswith("python_runtime_")
+                        )
+                    )
                 ]
                 if changed_authority:
                     raise TransitionConflict(
@@ -6195,11 +7205,17 @@ class SQLiteStore:
                 """INSERT INTO focused_test_plans
                    (id, work_item_id, plan_number, executable_path, executable_device,
                     executable_inode, executable_owner_uid, executable_mode,
-                    executable_sha256, test_file, selector, environment_json,
+                    executable_sha256, sandbox_policy_version,
+                    sandbox_executable_path, sandbox_executable_device,
+                    sandbox_executable_inode, sandbox_executable_owner_uid,
+                    sandbox_executable_mode, sandbox_executable_sha256,
+                    python_runtime_root, python_runtime_sha256,
+                    test_file, selector, environment_json,
                     environment_sha256, workspace_manifest_json,
                     workspace_manifest_sha256, runtime_root, timeout_seconds,
                     output_limit_bytes, created_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     plan_id,
                     work_item_id,
@@ -6210,6 +7226,15 @@ class SQLiteStore:
                     executable["owner_uid"],
                     executable["mode"],
                     executable["sha256"],
+                    DARWIN_SANDBOX_POLICY_VERSION,
+                    sandbox["path"],
+                    sandbox["device"],
+                    sandbox["inode"],
+                    sandbox["owner_uid"],
+                    sandbox["mode"],
+                    sandbox["sha256"],
+                    str(interpreter_root),
+                    interpreter_root_hash,
                     test_file,
                     selector,
                     _dump(base_environment),
@@ -6232,6 +7257,7 @@ class SQLiteStore:
                     "plan_number": plan_number,
                     "selector": selector,
                     "test_file": test_file,
+                    "sandbox_policy_version": DARWIN_SANDBOX_POLICY_VERSION,
                 },
                 created_at=now,
             )
@@ -6282,6 +7308,13 @@ class SQLiteStore:
                 if job["workspace_kind"] != WorkspaceKind.MANAGED_WORKTREE.value:
                     raise LeaseConflict("focused executions require a managed worktree")
                 self._assert_managed_worktree_binding(connection, job)
+                attempt_admission = self._assert_attempt_focused_test_admission(
+                    connection, job
+                )
+                if attempt_admission is None:
+                    raise LeaseConflict(
+                        "authoritative focused execution requires an exact admission"
+                    )
                 existing = connection.execute(
                     "SELECT * FROM focused_test_executions WHERE attempt_id = ?",
                     (job["current_attempt_id"],),
@@ -6304,9 +7337,12 @@ class SQLiteStore:
                         "focused/browser/database pipeline"
                     )
                 plan = connection.execute(
-                    """SELECT * FROM focused_test_plans WHERE work_item_id = ?
-                       ORDER BY plan_number DESC LIMIT 1""",
-                    (job["work_item_id"],),
+                    """SELECT * FROM focused_test_plans
+                       WHERE id = ? AND work_item_id = ?""",
+                    (
+                        attempt_admission["focused_test_plan_id"],
+                        job["work_item_id"],
+                    ),
                 ).fetchone()
                 if plan is None:
                     raise LeaseConflict("current work item has no authoritative focused test plan")
@@ -6337,6 +7373,32 @@ class SQLiteStore:
                 }
                 if executable != expected_executable:
                     raise LeaseConflict("focused Python executable identity changed")
+                if plan["sandbox_policy_version"] != DARWIN_SANDBOX_POLICY_VERSION:
+                    raise LeaseConflict(
+                        "focused test plan lacks the current trusted sandbox policy"
+                    )
+                sandbox = self._focused_sandbox_executable_identity(
+                    str(plan["sandbox_executable_path"])
+                )
+                expected_sandbox = {
+                    "path": str(plan["sandbox_executable_path"]),
+                    "device": int(plan["sandbox_executable_device"]),
+                    "inode": int(plan["sandbox_executable_inode"]),
+                    "owner_uid": int(plan["sandbox_executable_owner_uid"]),
+                    "mode": int(plan["sandbox_executable_mode"]),
+                    "sha256": str(plan["sandbox_executable_sha256"]),
+                }
+                if sandbox != expected_sandbox:
+                    raise LeaseConflict("focused Seatbelt executable identity changed")
+                interpreter_root = python_runtime_root(
+                    Path(str(executable["path"]))
+                )
+                interpreter_root_hash = python_runtime_sha256(interpreter_root)
+                if (
+                    str(interpreter_root) != plan["python_runtime_root"]
+                    or interpreter_root_hash != plan["python_runtime_sha256"]
+                ):
+                    raise LeaseConflict("focused Python runtime changed")
                 expected_manifest = self._normalize_focused_manifest(
                     _load(plan["workspace_manifest_json"], {})
                 )
@@ -6354,6 +7416,12 @@ class SQLiteStore:
                     runtime_root, repository_path
                 ):
                     raise LeaseConflict("focused runtime root overlaps a target repository")
+                if self._paths_overlap(interpreter_root, cwd) or self._paths_overlap(
+                    interpreter_root, repository_path
+                ):
+                    raise LeaseConflict(
+                        "focused Python runtime root overlaps a target repository"
+                    )
                 item_directory = runtime_root / str(job["work_item_id"])
                 if item_directory.exists():
                     self._assert_private_directory(item_directory)
@@ -6369,7 +7437,7 @@ class SQLiteStore:
                 if artifact_directory.exists():
                     raise LeaseConflict("focused artifact directory already exists")
 
-                command = [
+                test_command = [
                     executable["path"],
                     "-I",
                     "-B",
@@ -6377,7 +7445,24 @@ class SQLiteStore:
                     str(plan["selector"]),
                     "-v",
                 ]
+                sandbox_profile = build_focused_sandbox_profile(
+                    test_executable=Path(str(executable["path"])),
+                    runtime_read_root=interpreter_root,
+                    workspace=cwd,
+                    run_parent=run_parent,
+                )
+                command = list(
+                    build_focused_sandbox_command(
+                        Path(str(sandbox["path"])), sandbox_profile, test_command
+                    )
+                )
                 command_hash = hashlib.sha256(_dump(command).encode("utf-8")).hexdigest()
+                test_command_hash = hashlib.sha256(
+                    _dump(test_command).encode("utf-8")
+                ).hexdigest()
+                sandbox_profile_hash = focused_sandbox_profile_sha256(
+                    sandbox_profile
+                )
                 base_environment = self._focused_environment(
                     _load(plan["environment_json"], {})
                 )
@@ -6400,7 +7485,14 @@ class SQLiteStore:
                         managed_worktree_id, managed_worktree_generation, status,
                         executable_path, executable_device, executable_inode,
                         executable_owner_uid, executable_mode, executable_sha256,
-                        test_file, selector, command_argv_json, command_argv_sha256,
+                        sandbox_policy_version, sandbox_executable_path,
+                        sandbox_executable_device, sandbox_executable_inode,
+                        sandbox_executable_owner_uid, sandbox_executable_mode,
+                        sandbox_executable_sha256, python_runtime_root,
+                        python_runtime_sha256,
+                        sandbox_profile, sandbox_profile_sha256,
+                        test_file, selector, test_command_argv_json,
+                        test_command_argv_sha256, command_argv_json, command_argv_sha256,
                         environment_json, environment_sha256, cwd, cwd_device,
                         cwd_inode, cwd_owner_uid, cwd_mode,
                         workspace_manifest_before_json,
@@ -6408,8 +7500,8 @@ class SQLiteStore:
                         artifact_directory, stdout_path, stderr_path,
                         timeout_seconds, output_limit_bytes, prepared_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?)""",
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         execution_id,
                         plan["id"],
@@ -6424,8 +7516,21 @@ class SQLiteStore:
                         executable["owner_uid"],
                         executable["mode"],
                         executable["sha256"],
+                        DARWIN_SANDBOX_POLICY_VERSION,
+                        sandbox["path"],
+                        sandbox["device"],
+                        sandbox["inode"],
+                        sandbox["owner_uid"],
+                        sandbox["mode"],
+                        sandbox["sha256"],
+                        str(interpreter_root),
+                        interpreter_root_hash,
+                        sandbox_profile,
+                        sandbox_profile_hash,
                         plan["test_file"],
                         plan["selector"],
+                        _dump(test_command),
+                        test_command_hash,
                         _dump(command),
                         command_hash,
                         _dump(effective_environment),
@@ -6542,6 +7647,85 @@ class SQLiteStore:
         )
 
     @staticmethod
+    def _assert_focused_sandbox_binding(execution: sqlite3.Row) -> None:
+        if execution["sandbox_policy_version"] != DARWIN_SANDBOX_POLICY_VERSION:
+            raise LeaseConflict("focused execution lacks trusted Seatbelt proof")
+        sandbox = SQLiteStore._focused_sandbox_executable_identity(
+            str(execution["sandbox_executable_path"])
+        )
+        expected_sandbox = {
+            "path": execution["sandbox_executable_path"],
+            "device": execution["sandbox_executable_device"],
+            "inode": execution["sandbox_executable_inode"],
+            "owner_uid": execution["sandbox_executable_owner_uid"],
+            "mode": execution["sandbox_executable_mode"],
+            "sha256": execution["sandbox_executable_sha256"],
+        }
+        if sandbox != expected_sandbox:
+            raise LeaseConflict("focused Seatbelt executable changed after preparation")
+
+        executable = SQLiteStore._focused_executable_identity(
+            str(execution["executable_path"])
+        )
+        expected_executable = {
+            "path": execution["executable_path"],
+            "device": execution["executable_device"],
+            "inode": execution["executable_inode"],
+            "owner_uid": execution["executable_owner_uid"],
+            "mode": execution["executable_mode"],
+            "sha256": execution["executable_sha256"],
+        }
+        if executable != expected_executable:
+            raise LeaseConflict("focused Python executable changed after preparation")
+        interpreter_root = python_runtime_root(Path(str(executable["path"])))
+        if (
+            str(interpreter_root) != execution["python_runtime_root"]
+            or python_runtime_sha256(interpreter_root)
+            != execution["python_runtime_sha256"]
+        ):
+            raise LeaseConflict("focused Python runtime changed after preparation")
+
+        cwd = Path(str(execution["cwd"]))
+        run_parent = Path(str(execution["run_parent"]))
+        expected_profile = build_focused_sandbox_profile(
+            test_executable=Path(str(executable["path"])),
+            runtime_read_root=interpreter_root,
+            workspace=cwd,
+            run_parent=run_parent,
+        )
+        if (
+            execution["sandbox_profile"] != expected_profile
+            or execution["sandbox_profile_sha256"]
+            != focused_sandbox_profile_sha256(expected_profile)
+        ):
+            raise LeaseConflict("focused Seatbelt profile changed after preparation")
+        expected_test_command = [
+            executable["path"],
+            "-I",
+            "-B",
+            str(cwd / str(execution["test_file"])),
+            str(execution["selector"]),
+            "-v",
+        ]
+        if (
+            _load(execution["test_command_argv_json"], []) != expected_test_command
+            or execution["test_command_argv_sha256"]
+            != hashlib.sha256(_dump(expected_test_command).encode("utf-8")).hexdigest()
+        ):
+            raise LeaseConflict("focused sandboxed test command changed")
+        expected_command = list(
+            build_focused_sandbox_command(
+                Path(str(sandbox["path"])), expected_profile, expected_test_command
+            )
+        )
+        if (
+            _load(execution["command_argv_json"], []) != expected_command
+            or execution["command_argv_sha256"]
+            != hashlib.sha256(_dump(expected_command).encode("utf-8")).hexdigest()
+        ):
+            raise LeaseConflict("focused Seatbelt launch command changed")
+
+    @staticmethod
     def _assert_focused_runtime_layout(execution: sqlite3.Row) -> None:
         run_parent = Path(str(execution["run_parent"]))
         SQLiteStore._assert_private_directory(run_parent)
@@ -6603,6 +7787,8 @@ class SQLiteStore:
         execution: Mapping[str, Any],
         stdout_artifact: Mapping[str, Any],
         stderr_artifact: Mapping[str, Any],
+        *,
+        block_admitted_red: bool,
     ) -> Dict[str, Any]:
         outcome = str(execution["outcome"])
         passed = outcome == "pass"
@@ -6618,6 +7804,8 @@ class SQLiteStore:
                     "execution_id": execution["id"],
                     "sha256": execution["stdout_sha256"],
                     "bytes": execution["stdout_bytes"],
+                    "sandbox_policy_version": execution["sandbox_policy_version"],
+                    "sandbox_profile_sha256": execution["sandbox_profile_sha256"],
                 },
             },
             {
@@ -6630,9 +7818,35 @@ class SQLiteStore:
                     "execution_id": execution["id"],
                     "sha256": execution["stderr_sha256"],
                     "bytes": execution["stderr_bytes"],
+                    "sandbox_policy_version": execution["sandbox_policy_version"],
+                    "sandbox_profile_sha256": execution["sandbox_profile_sha256"],
                 },
             },
         ]
+        if not passed and block_admitted_red:
+            return {
+                "schema_version": 1,
+                "item_id": execution["work_item_id"],
+                "outcome": "blocked",
+                "summary": (
+                    "The admitted focused test failed; this tester-only authority "
+                    "cannot launch a fixer."
+                ),
+                "gate_proofs": [],
+                "failure_summary": None,
+                "blocker": {
+                    "kind": "execution",
+                    "summary": (
+                        "The admitted focused test failed and no authorized fixer "
+                        "path exists in this campaign mode."
+                    ),
+                    "next_action": (
+                        "Create a separately approved pre-launch campaign and "
+                        "repository admission before starting a new fix cycle."
+                    ),
+                    "evidence": evidence,
+                },
+            }
         return {
             "schema_version": 1,
             "item_id": execution["work_item_id"],
@@ -6668,7 +7882,8 @@ class SQLiteStore:
             )
         self._assert_managed_worktree_binding(connection, job)
         attempt = connection.execute(
-            "SELECT managed_worktree_generation FROM attempts WHERE id = ?",
+            """SELECT managed_worktree_generation, focused_test_admission_id
+               FROM attempts WHERE id = ?""",
             (job["current_attempt_id"],),
         ).fetchone()
         if (
@@ -6687,21 +7902,13 @@ class SQLiteStore:
             external is None
             or external["provider"] != "focused_test"
             or external["state"] != "stopped"
-            or external["target_executable"] != execution["executable_path"]
+            or external["target_executable"]
+            != execution["sandbox_executable_path"]
         ):
             raise LeaseConflict(
                 "focused execution requires its exact durably stopped process"
             )
-        executable = self._focused_executable_identity(str(execution["executable_path"]))
-        if executable != {
-            "path": execution["executable_path"],
-            "device": execution["executable_device"],
-            "inode": execution["executable_inode"],
-            "owner_uid": execution["executable_owner_uid"],
-            "mode": execution["executable_mode"],
-            "sha256": execution["executable_sha256"],
-        }:
-            raise LeaseConflict("focused execution executable changed after collection")
+        self._assert_focused_sandbox_binding(execution)
         cwd = Path(str(execution["cwd"]))
         cwd_details = cwd.lstat()
         if (
@@ -6759,7 +7966,10 @@ class SQLiteStore:
         stderr_artifact = artifacts[execution["stderr_artifact_id"]]
         assert stdout_artifact is not None and stderr_artifact is not None
         canonical = self._canonical_focused_handoff(
-            execution_data, stdout_artifact, stderr_artifact
+            execution_data,
+            stdout_artifact,
+            stderr_artifact,
+            block_admitted_red=attempt["focused_test_admission_id"] is not None,
         )
         persisted_canonical = _load(execution["canonical_handoff_json"], None)
         if persisted_canonical is not None and persisted_canonical != canonical:
@@ -6785,12 +7995,20 @@ class SQLiteStore:
             if job["role"] != "tester":
                 raise LeaseConflict("focused completion requires a tester lease")
             self._assert_managed_worktree_binding(connection, job)
+            attempt_admission = self._assert_attempt_focused_test_admission(
+                connection, job
+            )
+            if attempt_admission is None:
+                raise LeaseConflict(
+                    "authoritative focused execution requires an exact admission"
+                )
             execution = connection.execute(
                 "SELECT * FROM focused_test_executions WHERE attempt_id = ?",
                 (job["current_attempt_id"],),
             ).fetchone()
             if execution is None or execution["status"] != "prepared":
                 raise LeaseConflict("current tester attempt has no prepared focused execution")
+            self._assert_focused_sandbox_binding(execution)
 
             required_exact = {
                 "execution_id": execution["id"],
@@ -6831,7 +8049,8 @@ class SQLiteStore:
                 external is None
                 or external["provider"] != "focused_test"
                 or external["state"] != "stopped"
-                or external["target_executable"] != execution["executable_path"]
+                or external["target_executable"]
+                != execution["sandbox_executable_path"]
             ):
                 raise LeaseConflict(
                     "focused completion requires its exact durably stopped process"
@@ -6904,6 +8123,12 @@ class SQLiteStore:
                                 "execution_id": execution["id"],
                                 "sha256": identity["sha256"],
                                 "bytes": identity["bytes"],
+                                "sandbox_policy_version": execution[
+                                    "sandbox_policy_version"
+                                ],
+                                "sandbox_profile_sha256": execution[
+                                    "sandbox_profile_sha256"
+                                ],
                             }
                         ),
                         now,
@@ -6997,7 +8222,10 @@ class SQLiteStore:
             )
             response = dict(execution_data)
             canonical_handoff = self._canonical_focused_handoff(
-                execution_data, stdout_artifact, stderr_artifact
+                execution_data,
+                stdout_artifact,
+                stderr_artifact,
+                block_admitted_red=True,
             )
             connection.execute(
                 """UPDATE focused_test_executions
@@ -7324,6 +8552,8 @@ class SQLiteStore:
         database_artifact: Optional[Mapping[str, Any]] = None,
     ) -> Dict[str, Any]:
         canonical = dict(focused)
+        if canonical["outcome"] == "blocked":
+            return canonical
         proofs = list(canonical["gate_proofs"])
         failures: List[str] = []
         if canonical["outcome"] != "pass":
@@ -7488,9 +8718,13 @@ class SQLiteStore:
                             connection, job, execution
                         )
                     )
-                    focused_handoff = self._canonical_focused_handoff(
-                        execution_data, stdout_artifact, stderr_artifact
+                    focused_handoff = _load(
+                        execution["canonical_handoff_json"], None
                     )
+                    if not isinstance(focused_handoff, dict):
+                        raise LeaseConflict(
+                            "focused canonical handoff is malformed"
+                        )
                     if required_gates == list(DEFAULT_REQUIRED_GATES):
                         browser = browser_artifact = None
                         database = database_artifact = None
@@ -7575,6 +8809,7 @@ class SQLiteStore:
             now = self._clock()
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
             self._assert_no_pending_operator_interrupt(connection, job_id)
+            self._assert_attempt_focused_test_admission(connection, job)
             if expected_item_state != job["active_item_state"]:
                 raise TransitionConflict("expected state does not match the job active state")
             if next_item_state not in STAGE_NEXT_STATES[job["role"]]:
@@ -9654,4 +10889,103 @@ _SCHEMA_V9 = [
        ON operator_controls(job_id, action) WHERE status = 'pending'""",
     """CREATE INDEX operator_control_history
        ON operator_controls(job_id, requested_at, id)""",
+]
+
+
+_SCHEMA_V10 = [
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_policy_version TEXT",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_path TEXT",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_device INTEGER",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_inode INTEGER",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_owner_uid INTEGER",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_mode INTEGER",
+    "ALTER TABLE focused_test_plans ADD COLUMN sandbox_executable_sha256 TEXT",
+    "ALTER TABLE focused_test_plans ADD COLUMN python_runtime_root TEXT",
+    "ALTER TABLE focused_test_plans ADD COLUMN python_runtime_sha256 TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_policy_version TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_path TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_device INTEGER",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_inode INTEGER",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_owner_uid INTEGER",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_mode INTEGER",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_executable_sha256 TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN python_runtime_root TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN python_runtime_sha256 TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_profile TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN sandbox_profile_sha256 TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN test_command_argv_json TEXT",
+    "ALTER TABLE focused_test_executions ADD COLUMN test_command_argv_sha256 TEXT",
+]
+
+
+_SCHEMA_V11 = [
+    """ALTER TABLE campaigns ADD COLUMN execution_mode TEXT NOT NULL
+       DEFAULT 'legacy'
+       CHECK(execution_mode IN ('legacy', 'focused_test_admission'))""",
+    """CREATE TABLE focused_test_admissions (
+        id TEXT PRIMARY KEY,
+        campaign_id TEXT NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        tester_job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        managed_worktree_id TEXT NOT NULL
+            REFERENCES managed_worktrees(id) ON DELETE RESTRICT,
+        managed_worktree_generation INTEGER NOT NULL
+            CHECK(managed_worktree_generation > 0),
+        focused_test_plan_id TEXT NOT NULL
+            REFERENCES focused_test_plans(id) ON DELETE RESTRICT,
+        focused_test_plan_sha256 TEXT NOT NULL,
+        campaign_config_sha256 TEXT NOT NULL,
+        job_payload_sha256 TEXT NOT NULL,
+        required_gates_sha256 TEXT NOT NULL,
+        repository_identity_json TEXT NOT NULL,
+        repository_identity_sha256 TEXT NOT NULL,
+        worktree_identity_json TEXT NOT NULL,
+        worktree_identity_sha256 TEXT NOT NULL,
+        resource_definition_ids_json TEXT NOT NULL,
+        resource_bindings_json TEXT NOT NULL,
+        resource_bindings_sha256 TEXT NOT NULL,
+        required_resources_sha256 TEXT NOT NULL,
+        authority_sha256 TEXT NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('active', 'revoked')),
+        admitted_by TEXT NOT NULL,
+        admission_reason TEXT NOT NULL,
+        admitted_at REAL NOT NULL,
+        revoked_by TEXT,
+        revocation_reason TEXT,
+        revoked_at REAL,
+        updated_at REAL NOT NULL,
+        CHECK(length(id) = 36 AND substr(id, 1, 4) = 'fta_'
+              AND substr(id, 5) NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(focused_test_plan_sha256) = 64
+              AND focused_test_plan_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(campaign_config_sha256) = 64
+              AND campaign_config_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(job_payload_sha256) = 64
+              AND job_payload_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(required_gates_sha256) = 64
+              AND required_gates_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(repository_identity_sha256) = 64
+              AND repository_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(worktree_identity_sha256) = 64
+              AND worktree_identity_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(resource_bindings_sha256) = 64
+              AND resource_bindings_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(required_resources_sha256) = 64
+              AND required_resources_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(authority_sha256) = 64
+              AND authority_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK((status = 'active' AND revoked_by IS NULL
+               AND revocation_reason IS NULL AND revoked_at IS NULL)
+              OR (status = 'revoked' AND revoked_by IS NOT NULL
+                  AND revocation_reason IS NOT NULL AND revoked_at IS NOT NULL)))""",
+    """CREATE UNIQUE INDEX one_active_focused_test_admission_per_tester_job
+       ON focused_test_admissions(tester_job_id) WHERE status = 'active'""",
+    """CREATE INDEX focused_test_admissions_campaign
+       ON focused_test_admissions(campaign_id, status, admitted_at, id)""",
+    """CREATE INDEX focused_test_admissions_item
+       ON focused_test_admissions(work_item_id, status, admitted_at, id)""",
+    """ALTER TABLE attempts ADD COLUMN focused_test_admission_id TEXT
+       REFERENCES focused_test_admissions(id) ON DELETE RESTRICT""",
+    """CREATE INDEX attempts_focused_test_admission
+       ON attempts(focused_test_admission_id, status)""",
 ]

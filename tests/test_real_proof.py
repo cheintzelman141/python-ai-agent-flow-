@@ -98,6 +98,21 @@ def test_fixed_proof_orchestrates_managed_flow_without_provider_claims(
     assert result.report["provider_checks_skipped"] is True
     assert result.report["sessions_distinct_and_persisted"] is False
     assert result.report["focused_test_execution_proof"] is True
+    assert result.report["focused_test_admission_proof"] is True
+    assert len(result.report["focused_test_admissions"]) == 1
+    tester_attempt = next(
+        attempt
+        for attempt in result.report["attempts"]
+        if next(
+            job
+            for job in result.report["jobs"]
+            if job["id"] == attempt["job_id"]
+        )["role"]
+        == "tester"
+    )
+    assert tester_attempt["focused_test_admission_id"] == result.report[
+        "focused_test_admission_id"
+    ]
     assert provider_roles == [WorkerRole.INVESTIGATOR, WorkerRole.FIXER]
     assert len(result.report["focused_test_plans"]) == 1
     assert len(result.report["focused_test_executions"]) == 1
@@ -368,6 +383,9 @@ def test_process_proof_rejects_incomplete_darwin_identity(tmp_path: Path) -> Non
         "guardian_executable": {"path": str(runner.guardian_executable)},
         "codex_executable": {"path": "/private/tmp/codex"},
         "python_executable": {"path": str(runner.python_executable)},
+        "focused_sandbox_executable": {
+            "path": str(runner.focused_sandbox_executable)
+        },
     }
     jobs = [
         {"id": "investigator-job", "role": "investigator"},
@@ -393,10 +411,10 @@ def test_process_proof_rejects_incomplete_darwin_identity(tmp_path: Path) -> Non
             "external_process_id": 202,
             "external_process_group_id": 202,
             "external_process_start_microseconds": 3,
-            "external_provider": "focused_test",
-            "external_process_target_executable": str(
-                runner.python_executable
-            ),
+                "external_provider": "focused_test",
+                "external_process_target_executable": str(
+                    runner.focused_sandbox_executable
+                ),
         }
     )
     attempts = [complete, second, third]
@@ -554,13 +572,16 @@ def test_executable_hash_drift_fails_closed(tmp_path: Path) -> None:
     git = tmp_path / "git"
     guardian = tmp_path / "guardian"
     python = tmp_path / "python"
+    sandbox = tmp_path / "sandbox-exec"
     git.write_bytes(b"git-before")
     guardian.write_bytes(b"guardian-before")
     python.write_bytes(b"python-before")
+    sandbox.write_bytes(b"sandbox-before")
     report = {
         "git_executable": runner._executable_record(git),
         "guardian_executable": runner._executable_record(guardian),
         "python_executable": runner._executable_record(python),
+        "focused_sandbox_executable": runner._executable_record(sandbox),
     }
 
     assert runner._executable_hashes_unchanged(report) is True
@@ -569,6 +590,7 @@ def test_executable_hash_drift_fails_closed(tmp_path: Path) -> None:
     assert runner.executable_baselines["git_executable"]["sha256"]
     assert runner.executable_baselines["guardian_executable"]["sha256"]
     assert runner.executable_baselines["python_executable"]["sha256"]
+    assert runner.executable_baselines["focused_sandbox_executable"]["sha256"]
 
 
 def _write_jsonl_events(path: Path, events: list) -> None:

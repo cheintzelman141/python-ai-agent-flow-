@@ -81,7 +81,38 @@ Phase 1 is implemented, and the first Phase 2 vertical slice is implemented:
 - durable `operator-interrupt` and `operator-resume` controls with exact lease,
   attempt, session/process, worktree-generation, resource-set, audit, process
   reap, restart, and one-time resume fences. Sequential collector process
-  records retain history while permitting only one active group per attempt.
+  records retain history while permitting only one active group per attempt;
+  and
+- schema-v10 immutable macOS Seatbelt contracts for the focused `unittest`
+  collector. Storage persists the exact root-owned sandbox executable,
+  direct Python interpreter and byte-hashed root-owned runtime, byte-stable
+  deny-default profile, logical test command, wrapped command, and hashes. The
+  worker independently
+  reconstructs the profile before launch. Real negative controls prove denial
+  of outside same-user reads, writes, and directory listings; worktree writes;
+  loopback networking; fork; other executables; subprocesses; and detached
+  children while the exact selector and private HOME/TMPDIR remain usable; and
+- schema-v11 internal focused-test admissions. One exact `fta_...` record binds
+  a pending tester job to its campaign/configuration, item gates, payload,
+  source snapshot, managed worktree generation, complete schema-v10 plan,
+  complete resource set, and registered-definition hashes. The persisted
+  focused-test-only campaign mode blocks investigator/fixer claims and new
+  worktree requests. Attempts pin the record, and heartbeat, guardian
+  registration, preparation, completion, and finalization all revalidate it.
+  The admission transaction remains open through the exact guardian barrier
+  release, so revocation and release have one serialized order. Revocation or
+  drift fails closed without blocking process reap. An admitted RED is stored
+  as a concrete BLOCKED handoff with its evidence and no impossible fixer
+  successor. This internal attributed precursor has no CLI and does not consume
+  or replace an operator approval.
+
+Migrated schema-v9 plans may receive a new schema-v10 revision. Already
+prepared legacy executions are intentionally not grandfathered into the new
+sandbox proof and cannot complete as authoritative evidence.
+Schema-v10 campaigns migrate to schema v11 in legacy mode with no admission;
+nothing is grandfathered into focused-test authority, and a legacy tester
+cannot prepare a real focused execution. Explicit Phase 1 simulation remains
+available only through `allow_simulated_evidence`.
 
 Resource commands still register and inspect definitions only. The fixed
 collectors are separate and accept only supervisor-prepared disposable
@@ -89,17 +120,27 @@ contracts: one exact visible `file://` route/title/body/screenshot workflow and
 one exact bounded SQLite `SELECT` under URI/read-only/authorizer enforcement.
 They do not authorize existing browser sessions, general application databases,
 worker-supplied actions/SQL, queues, or target mutations. General real-worker
-campaign execution remains intentionally disabled because the current macOS
-runtime does not prove denial of same-user filesystem access, network access,
-or detached children for arbitrary repository test code.
+campaign execution remains intentionally disabled because this sandbox
+authorizes only the immutable supervisor-owned macOS `unittest` contract; no
+general campaign admission path yet binds user-approved repositories,
+worktrees, test plans, and resource definitions without accepting
+worker-selected authority.
+The v11 precursor is created only after investigator, worktree, and fixer work,
+so it does not authorize those earlier real launches. General execution stays
+disabled until a pre-launch, approval-consuming campaign/repository contract is
+proven before any investigator or guarded Git process can start.
 
 ## Phase 2 pickup point
 
 Continue the real worker and environment adapters without weakening Phase 1's
 storage boundary:
 
-1. Prove an OS sandbox or narrower trusted harness before allowing arbitrary repository
-   test code through the focused-test collector.
+1. Design and prove the missing pre-launch admission scope. It must consume a
+   separately resolved operator approval and bind the exact campaign and source
+   repository before investigator claim or managed-worktree provisioning, then
+   carry exact worktree, plan, and resource authority through fixer and tester.
+   Keep worker-supplied commands, paths, routes, SQL, credentials, and target
+   selection unauthorized.
 2. Add a non-disposable application-database backend only after its credential,
    read-only session, query-authority, and isolation boundaries are separately
    specified and proven; keep the current implementation SQLite-only.

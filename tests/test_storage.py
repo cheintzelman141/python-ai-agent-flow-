@@ -1029,7 +1029,7 @@ def test_schema_v1_database_migrates_external_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 11
     assert {
         "external_provider",
         "external_session_id",
@@ -1064,7 +1064,7 @@ def test_schema_v2_database_migrates_process_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 11
     assert {
         "external_provider",
         "external_session_id",

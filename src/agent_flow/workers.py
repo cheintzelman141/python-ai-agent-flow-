@@ -3,7 +3,17 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Any, Callable, Deque, Dict, Mapping, Optional, Protocol, Union
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Deque,
+    Dict,
+    Mapping,
+    Optional,
+    Protocol,
+    Union,
+)
 
 from pydantic import BaseModel
 
@@ -27,6 +37,9 @@ class WorkerContext:
     _external_process_clearer: Optional[Callable[[int, int], None]] = field(
         default=None, repr=False, compare=False
     )
+    _focused_test_guardian_release_fencer: Optional[
+        Callable[[ProcessIdentity, str], ContextManager[None]]
+    ] = field(default=None, repr=False, compare=False)
     _artifact_recorder: Optional[
         Callable[[str, str, Mapping[str, Any]], None]
     ] = field(default=None, repr=False, compare=False)
@@ -94,6 +107,19 @@ class WorkerContext:
                 "this worker context cannot clear an external process"
             )
         self._external_process_clearer(process_id, process_group_id)
+
+    def focused_test_guardian_release_fence(
+        self, identity: ProcessIdentity, target_executable: str
+    ) -> ContextManager[None]:
+        """Serialize exact guardian release against admission revocation."""
+
+        if self._focused_test_guardian_release_fencer is None:
+            raise WorkerExecutionError(
+                "this worker context cannot authorize focused-test guardian release"
+            )
+        return self._focused_test_guardian_release_fencer(
+            identity, target_executable
+        )
 
     def record_artifact(
         self, kind: str, uri: str, metadata: Mapping[str, Any]

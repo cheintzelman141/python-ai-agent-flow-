@@ -142,7 +142,7 @@ def test_schema_v9_and_immutable_collector_plans(
         }
         assert store.foreign_key_violations() == []
 
-    assert version == SCHEMA_VERSION == 9
+    assert version == SCHEMA_VERSION == 11
     assert {
         "browser_evidence_plans",
         "browser_evidence_executions",
