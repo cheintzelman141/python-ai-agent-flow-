@@ -21,6 +21,7 @@ from agent_flow.models import (
     TestOutcome,
     WorkerRole,
 )
+from agent_flow.real_proof import run_authenticated_disposable_proof_sync
 from agent_flow.scheduler import Scheduler
 from agent_flow.sqlite_scheduler import LOCAL_WRITE_APPROVAL_ACTION, SQLiteSchedulerStorage
 from agent_flow.status import render_status
@@ -552,6 +553,60 @@ def simulate(
             console=console,
         )
         console.print("Simulation campaign: %s" % campaign["id"])
+
+
+@app.command("prove-real-codex")
+def prove_real_codex(
+    acknowledge_live_model: bool = typer.Option(
+        False,
+        "--acknowledge-live-model",
+        help="Run three authenticated Codex stages against a fixed disposable fixture.",
+    ),
+) -> None:
+    """Run the fixed authenticated investigator/fixer/tester acceptance proof."""
+
+    if not acknowledge_live_model:
+        raise typer.BadParameter(
+            "--acknowledge-live-model is required; this command invokes live Codex"
+        )
+    result = run_authenticated_disposable_proof_sync()
+    table = Table(title="Authenticated disposable Codex proof")
+    table.add_column("Proof")
+    table.add_column("Outcome")
+    table.add_row("Final state", str(result.report.get("final_item_state") or "blocked"))
+    table.add_row("Source unchanged", str(result.report.get("source_unchanged") is True))
+    table.add_row(
+        "Exact managed diff",
+        str(result.report.get("exact_worktree_diff") is True),
+    )
+    table.add_row(
+        "Provider boundary",
+        str(
+            result.report.get("sessions_distinct_and_persisted") is True
+            and result.report.get("all_processes_stopped") is True
+            and result.report.get("provider_artifacts_valid") is True
+            and result.report.get("session_events_precede_completion") is True
+            and result.report.get("artifact_events_valid") is True
+            and result.report.get("executable_hashes_unchanged") is True
+        ),
+    )
+    table.add_row(
+        "Tester command",
+        str(result.report.get("tester_command_proof") is True),
+    )
+    table.add_row(
+        "SQLite integrity",
+        str(
+            result.report.get("foreign_key_violations") == []
+            and result.report.get("scheduler_error_free") is True
+            and not result.report.get("resource_leases")
+        ),
+    )
+    console.print(table)
+    console.print("Proof root: %s" % result.root)
+    console.print("Report: %s" % result.report_path)
+    if not result.verified:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

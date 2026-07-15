@@ -51,13 +51,15 @@
 - Clean non-force removal with managed branch retention
 - Managed-worktree and lifecycle-operation status visibility
 - Explicit provision, verify, cleanup, and reconcile CLI commands
+- Fixed-fixture authenticated real Codex proof command with explicit live-model acknowledgement
+- Green authenticated investigator -> managed fixer -> same-worktree tester acceptance run
 - Disposable real-Git creation, hidden-change refusal, filter-execution prevention,
   branch-retention, and crash-reconciliation coverage
 
 ## Phase 2 next
 
-- Authenticated disposable managed fixer -> same-worktree tester Codex proof
-- General real-worker CLI enablement after the disposable proof
+- Storage-authoritative focused-test command and output evidence collector
+- General real-worker CLI enablement only after durable evidence collection
 - Visible Chrome control and browser evidence collection
 - Application database/tenant/fixture adapters
 - Real focused-test, browser, database, GL, export, and API artifact collectors

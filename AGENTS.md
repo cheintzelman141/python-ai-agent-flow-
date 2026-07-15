@@ -36,8 +36,9 @@ Phase 1 must not:
 
 ## Phase 2 Current Slice
 
-The first Phase 2 vertical slice adds a real Codex CLI worker boundary while
-keeping Phase 1 storage authoritative. It includes:
+The current Phase 2 vertical slice adds a real Codex CLI worker boundary and
+managed Git-worktree lifecycle while keeping Phase 1 storage authoritative. It
+includes:
 
 - strict investigator, fixer, and tester output schemas;
 - read-only investigator/tester execution and workspace-write fixer execution
@@ -58,12 +59,21 @@ keeping Phase 1 storage authoritative. It includes:
 - separately fenced restart reconciliation that revalidates exact Darwin
   process identity before TERM/KILL and atomically recovers only after group
   absence is proven; and
-- status visibility for external sessions and processes.
+- status visibility for external sessions and processes;
+- durable creation, verification, cleanup, quarantine retry, and restart
+  reconciliation for exact locked managed worktrees;
+- scheduler-fenced fixer authorization and same-worktree tester inheritance;
+- payload-independent workspace selection with exact pre/postflight Git and
+  filesystem identity validation; and
+- an opt-in `prove-real-codex --acknowledge-live-model` command that accepts no
+  target paths and proves the authenticated investigator -> managed fixer ->
+  same-worktree tester boundary against a fixed disposable fixture.
 
-This slice does not yet provide the managed worktree lifecycle,
-Chrome/database evidence adapters, or CLI commands that enable real repository
-campaigns. Do not expose fixer execution until the supervisor owns worktree
-creation and cleanup.
+This slice does not yet provide durable browser/database evidence collectors or
+general real-repository campaign execution. The current evidence attachment
+gate proves file existence but not the semantics of arbitrary test, browser, or
+database commands. Keep general real campaigns disabled until those collectors
+exist and are proven against disposable fixtures.
 
 ## Architecture Rules
 

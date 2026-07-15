@@ -58,22 +58,26 @@ Phase 1 is implemented, and the first Phase 2 vertical slice is implemented:
   `worktree-reconcile` commands, including exact-state retry of quarantined
   lifecycle guardians; and
 - fake-CLI integration plus an authenticated, disposable, read-only Codex
-  smoke run through Scheduler -> SQLite.
+  smoke run through Scheduler -> SQLite; and
+- a green opt-in fixed-fixture `prove-real-codex` acceptance command covering
+  authenticated investigator -> managed fixer -> same-worktree tester with
+  exact session, process, artifact, source, diff, test, lease, and SQLite proof.
 
 Visible Chrome and application database adapters do not exist yet. General
-real-worker campaign execution remains intentionally disabled pending an
-authenticated disposable managed fixer -> tester proof.
+real-worker campaign execution remains intentionally disabled because generic
+evidence attachments prove file existence, not the semantics of arbitrary
+commands, browser flows, or database queries.
 
 ## Phase 2 pickup point
 
 Continue the real worker and environment adapters without weakening Phase 1's
 storage boundary:
 
-1. Run an authenticated disposable investigator -> managed-worktree fixer ->
-   same-worktree tester campaign and prove exact session/process/artifact,
-   source immutability, changed-file, and foreign-key evidence.
-2. Add the explicit real-worker campaign/run CLI only after that proof remains
-   green; never accept workspace paths from job payloads.
+1. Add durable focused-test evidence collection that records the exact argv,
+   cwd, exit code, bounded stdout/stderr, hashes, and attempt/worktree fence.
+2. Keep general real-worker campaign/run CLI disabled until the focused-test
+   collector is storage-authoritative; never accept workspace paths from job
+   payloads.
 3. Add resource definitions for visible Chrome profiles, tenants, databases,
    queues, and fixtures.
 4. Add real evidence collectors that register focused-test output, screenshots,

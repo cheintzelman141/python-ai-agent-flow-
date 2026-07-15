@@ -146,6 +146,12 @@ def _strict_output_schema(model: Type[BaseModel]) -> Dict[str, Any]:
     return schema
 
 
+def codex_handoff_schema(role: WorkerRole) -> Dict[str, Any]:
+    """Return the exact strict provider schema used for one worker role."""
+
+    return _strict_output_schema(_HANDOFF_BY_ROLE[role])
+
+
 @dataclass(frozen=True)
 class CodexCliConfig:
     """Supervisor-owned Codex execution configuration."""
@@ -380,7 +386,7 @@ class CodexCliWorker:
         events_path = run_directory / "events.jsonl"
         stderr_path = run_directory / "stderr.log"
         final_path = run_directory / "final.json"
-        schema = _strict_output_schema(_HANDOFF_BY_ROLE[self.role])
+        schema = codex_handoff_schema(self.role)
         schema_path.write_text(
             json.dumps(schema, indent=2, sort_keys=True), encoding="utf-8"
         )
