@@ -40,6 +40,9 @@ class WorkerContext:
     _focused_test_guardian_release_fencer: Optional[
         Callable[[ProcessIdentity, str], ContextManager[None]]
     ] = field(default=None, repr=False, compare=False)
+    _browser_guardian_release_fencer: Optional[
+        Callable[[ProcessIdentity, str], ContextManager[None]]
+    ] = field(default=None, repr=False, compare=False)
     _artifact_recorder: Optional[
         Callable[[str, str, Mapping[str, Any]], None]
     ] = field(default=None, repr=False, compare=False)
@@ -65,6 +68,9 @@ class WorkerContext:
         Callable[[], Mapping[str, Any]]
     ] = field(default=None, repr=False, compare=False)
     _database_query_execution_completer: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _database_query_execution_authorizer: Optional[
         Callable[[Mapping[str, Any]], Mapping[str, Any]]
     ] = field(default=None, repr=False, compare=False)
 
@@ -119,6 +125,19 @@ class WorkerContext:
             )
         return self._focused_test_guardian_release_fencer(
             identity, target_executable
+        )
+
+    def browser_guardian_release_fence(
+        self, identity: ProcessIdentity, target_executable: str
+    ) -> ContextManager[None]:
+        """Serialize exact browser guardian release against admission revocation."""
+
+        if self._browser_guardian_release_fencer is not None:
+            return self._browser_guardian_release_fencer(identity, target_executable)
+        if self._focused_test_guardian_release_fencer is not None:
+            return self._focused_test_guardian_release_fencer(identity, target_executable)
+        raise WorkerExecutionError(
+            "this worker context cannot authorize browser guardian release"
         )
 
     def record_artifact(
@@ -229,6 +248,15 @@ class WorkerContext:
                 "database-evidence preparation returned an invalid contract"
             )
         return prepared
+
+    def authorize_database_query_execution(
+        self, contract: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Revalidate an attempt-pinned database admission immediately before query."""
+
+        if self._database_query_execution_authorizer is None:
+            return contract
+        return self._database_query_execution_authorizer(contract)
 
     def complete_database_query_execution(
         self, result: Mapping[str, Any]

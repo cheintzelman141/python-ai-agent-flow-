@@ -177,6 +177,24 @@ the exact campaign and source repository before investigator or Git execution,
 then carries that authority through fixer and tester admission. Existing
 schema-v10 campaigns receive no automatic admission during migration.
 
+
+## Phase 2 admission-bound collector correction
+
+The current schema-v11 focused-test admission is also revalidated by the
+supervisor-owned browser and database collectors before they execute or
+canonicalize evidence. Browser guardian release now uses the same transactional
+release fence pattern as focused tests, so revocation and target launch have one
+durable ordering. The SQLite database collector is revalidated immediately
+before the bounded read and again before completion. Revocation remains allowed
+to clear, terminate, and reap already-recorded process groups; it does not
+authorize new browser launches or database reads.
+
+This correction does not expose general real-campaign execution. The missing
+pre-launch campaign/repository admission remains the next schema revision and
+must still consume an explicit operator approval before any general investigator,
+managed-worktree, fixer, tester, browser, or database boundary can run against a
+non-disposable target.
+
 ## Development
 
 The project supports Python 3.9 and later.
