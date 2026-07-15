@@ -690,6 +690,7 @@ def _active_resource_table(resource_leases: Sequence[Record], as_of: datetime) -
 
     table = Table(title="Resource leases", box=box.SIMPLE_HEAVY, expand=True)
     table.add_column("Resource")
+    table.add_column("Definition")
     table.add_column("Owner")
     table.add_column("Job")
     table.add_column("State")
@@ -704,13 +705,22 @@ def _active_resource_table(resource_leases: Sequence[Record], as_of: datetime) -
             state = "Expired"
         table.add_row(
             _string_value(lease, "resource_key", "-"),
+            (
+                "%s / %s"
+                % (
+                    _string_value(lease, "resource_label", "-"),
+                    _label(_string_value(lease, "resource_kind", "unknown")),
+                )
+                if _value(lease, "resource_definition_id", None) is not None
+                else "-"
+            ),
             _string_value(lease, "lease_owner", "-"),
             _string_value(lease, "job_id", "-"),
             state,
             _timestamp_label(_value(lease, "lease_expires_at", None)),
         )
     if not ordered_leases:
-        table.add_row("None", "-", "-", "-", "-")
+        table.add_row("None", "-", "-", "-", "-", "-")
     return table
 
 

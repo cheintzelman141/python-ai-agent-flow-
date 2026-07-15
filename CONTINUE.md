@@ -34,7 +34,8 @@ Phase 1 is implemented, and the first Phase 2 vertical slice is implemented:
   complete process-group reap, including cancellation before child launch;
 - schema-v5 durable external session, process, managed-worktree, and lifecycle
   operation identity;
-- exact-session resume for cleanly interrupted attempts;
+- explicit one-time exact-session resume authorization for cleanly interrupted
+  attempts;
 - fenced, hashed Codex artifacts outside the target repository;
 - cancellation/timeout process-group reap;
 - fenced restart-time Darwin process reconciliation with exact PID, PGID, UID,
@@ -66,29 +67,45 @@ Phase 1 is implemented, and the first Phase 2 vertical slice is implemented:
 - a strict read-only `watch` terminal monitor with transactionally consistent,
   bounded-detail campaign snapshots, exact aggregate totals, alert-prioritized
   per-item lanes, worker/session/resource state, persisted alerts, non-TTY
-  protection, and clean `Ctrl+C` handling.
+  protection, and clean `Ctrl+C` handling; and
+- schema-v9 durable definitions for `chrome_profile`, `tenant_database`,
+  `queue_environment`, and `test_fixture`, with opaque exact IDs, typed and
+  secret-rejecting configuration, optional campaign scope, display-safe
+  metadata, enable/disable audit history, and explicit exclusive or bounded
+  shared capacity. Definitions remain separate from active leases; storage
+  resolves definition IDs during claims, skips unavailable-resource jobs, and
+  preserves fencing, release, and restart recovery events; and
+- fixed supervisor-owned visible-Chrome and read-only SQLite evidence plans,
+  attempt/job/resource-bound executions, hashed screenshot/query artifacts,
+  and storage-canonical three-gate handoff replacement; and
+- durable `operator-interrupt` and `operator-resume` controls with exact lease,
+  attempt, session/process, worktree-generation, resource-set, audit, process
+  reap, restart, and one-time resume fences. Sequential collector process
+  records retain history while permitting only one active group per attempt.
 
-Visible Chrome and application database adapters do not exist yet. General
-real-worker campaign execution remains intentionally disabled because generic
-evidence attachments prove file existence, not the semantics of arbitrary
-commands, browser flows, or database queries.
+Resource commands still register and inspect definitions only. The fixed
+collectors are separate and accept only supervisor-prepared disposable
+contracts: one exact visible `file://` route/title/body/screenshot workflow and
+one exact bounded SQLite `SELECT` under URI/read-only/authorizer enforcement.
+They do not authorize existing browser sessions, general application databases,
+worker-supplied actions/SQL, queues, or target mutations. General real-worker
+campaign execution remains intentionally disabled because the current macOS
+runtime does not prove denial of same-user filesystem access, network access,
+or detached children for arbitrary repository test code.
 
 ## Phase 2 pickup point
 
 Continue the real worker and environment adapters without weakening Phase 1's
 storage boundary:
 
-1. Add resource definitions for visible Chrome profiles, tenants, databases,
-   queues, and fixtures.
-2. Add real evidence collectors that register screenshots, browser routes, SQL
-   results, IDs, and hashes as durable artifacts.
-3. Add explicit operator interruption/resume CLI commands; use only the exact
-   external session ID already bound to the same logical job.
-4. Add an OS sandbox or trusted harness before allowing arbitrary repository
+1. Prove an OS sandbox or narrower trusted harness before allowing arbitrary repository
    test code through the focused-test collector.
-5. Validate visible browser and application-database adapters in disposable
-   fixtures before enabling any production repository.
-6. Build the native macOS worker-lane dashboard only after the CLI/runtime path
+2. Add a non-disposable application-database backend only after its credential,
+   read-only session, query-authority, and isolation boundaries are separately
+   specified and proven; keep the current implementation SQLite-only.
+3. Add GL and any further evidence collectors behind the same immutable-plan,
+   exact-resource, bounded-artifact, and storage-canonical pattern.
+4. Build the native macOS worker-lane dashboard only after the CLI/runtime path
    remains green.
 
 Do not add auto-push, auto-merge, auto-deploy, customer sends, production sync,

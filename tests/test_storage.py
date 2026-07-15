@@ -1029,7 +1029,7 @@ def test_schema_v1_database_migrates_external_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 7
+    assert version == SCHEMA_VERSION == 9
     assert {
         "external_provider",
         "external_session_id",
@@ -1064,7 +1064,7 @@ def test_schema_v2_database_migrates_process_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 7
+    assert version == SCHEMA_VERSION == 9
     assert {
         "external_provider",
         "external_session_id",
@@ -1086,6 +1086,19 @@ def test_external_session_is_fenced_resumable_and_cannot_cross_jobs(
     assert first_claim is not None
     session_id = "019f6677-1111-7222-8333-444444444444"
 
+    store.record_external_process(
+        first_job["id"],
+        "worker-a",
+        first_claim["lease_token"],
+        "codex",
+        32099,
+        32099,
+        os.getuid(),
+        "/usr/bin/python3",
+        29,
+        39,
+        "/usr/local/bin/codex",
+    )
     recorded = store.record_external_session(
         first_job["id"],
         "worker-a",
@@ -1114,11 +1127,26 @@ def test_external_session_is_fenced_resumable_and_cannot_cross_jobs(
             session_id,
         )
 
+    store.clear_external_process(
+        first_job["id"],
+        "worker-a",
+        first_claim["lease_token"],
+        32099,
+        32099,
+    )
+
     store.interrupt_job(
         first_job["id"],
         "worker-a",
         first_claim["lease_token"],
         reason="clean stop for exact-session resume",
+    )
+    store.request_job_resume(
+        first_job["id"],
+        first_claim["attempt_id"],
+        "codex",
+        session_id,
+        requested_by="operator-a",
     )
     resumed = store.claim_job("investigator", "worker-b")
     assert resumed is not None
@@ -1232,6 +1260,13 @@ def test_reaped_external_process_can_be_cleanly_interrupted_and_resumed(
         "worker-a",
         claim["lease_token"],
         reason="adapter reaped process group",
+    )
+    store.request_job_resume(
+        job["id"],
+        claim["attempt_id"],
+        "codex",
+        "019f6677-aaaa-7bbb-8ccc-dddddddddddd",
+        requested_by="operator-a",
     )
     resumed = store.claim_job("investigator", "worker-b")
 

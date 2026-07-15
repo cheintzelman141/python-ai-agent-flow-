@@ -89,7 +89,28 @@ focused-test collector:
   persisted alerts, worker leases, sessions, resources, and recent events.
   Status and watch use strict read-only SQLite connections, require the current
   schema, never migrate, and read each screen from one transactionally
-  consistent snapshot with a bounded recent-event window.
+  consistent snapshot with a bounded recent-event window; and
+- schema-v9 resource definitions register visible Chrome profiles, application
+  tenants/databases, queue environments, and disposable test fixtures by
+  opaque exact ID. Definitions are typed, campaign-scoped or global,
+  enabled/disabled, display-safe, and separate from their active leases.
+  Claims resolve registered IDs in storage, fail closed on missing, disabled,
+  malformed, or out-of-scope definitions, and enforce exclusive or bounded
+  shared capacity through the existing fenced lease lifecycle;
+- supervisor-owned browser and database plans bind an exact resource identity,
+  attempt, job, and immutable contract. The browser collector can only open a
+  disposable `file://` fixture in visible Chrome, assert its exact route/title/
+  body, and capture a bounded hashed PNG. It runs inside the same durable
+  process-group guardian and restart-reconciliation boundary as focused tests;
+- the first database collector is deliberately SQLite-only. It resolves an
+  environment-key reference from the registered disposable tenant, opens URI
+  `mode=ro`, enables `query_only`, denies every non-read authorizer action, and
+  persists bounded exact IDs, row counts, query/result hashes, and foreign-key
+  results; and
+- `operator-interrupt` records an exact current lease/attempt/process/session/
+  worktree/resource request for scheduler-owned cancellation and reap.
+  `operator-resume` replaces automatic resume with one explicit, one-time,
+  same-job authorization for the exact stopped external session.
 
 The fixed authenticated acceptance command creates its own private disposable
 repository, runs a source-only Codex investigator and an approved managed-
@@ -106,16 +127,17 @@ artifact hashes, released leases, unchanged source, and SQLite foreign-key
 integrity.
 
 The real adapter is intentionally not exposed as a general campaign CLI yet.
-The managed-worktree lifecycle and fixed proof command are available to
-operators, but focused-test authority is limited to that command's exact trusted
-fixture. The storage schema and worker API do not authorize arbitrary repository
-test code: the collector does not yet block same-user filesystem access,
-network access, or detached subprocesses, and transcript parsing is not a
-trusted general test harness. Visible Chrome, application-database, and GL
-collectors also remain unimplemented. General real-worker execution stays
-disabled until an OS sandbox or trusted harness and those evidence collectors
-prove what ran and what passed; this project does not yet claim end-to-end
-production-line green.
+The managed-worktree lifecycle, fixed proof command, and fixed disposable
+three-gate pipeline are available, but they do not authorize arbitrary
+repository test code, browser actions, SQL, credentials, or target paths. The
+focused collector does not yet block same-user filesystem access, network
+access, or detached subprocesses, and transcript parsing is not a trusted
+general test harness. Existing browser profiles and application databases are
+not authorized by resource registration alone; the current collectors accept
+only supervisor-prepared disposable contracts, and the database implementation
+is SQLite-only. GL collection remains unimplemented. General real-worker
+execution stays disabled until an OS sandbox or a narrowly trusted harness
+proves the remaining filesystem/network/child-process boundary.
 
 ## Development
 
@@ -160,6 +182,48 @@ repositories:
 
 ```bash
 PYTHONPATH=src python3 -m agent_flow.cli approve-writes CAMPAIGN_ID --by USERNAME
+```
+
+Register durable environment resources without touching the external systems:
+
+```bash
+PYTHONPATH=src python3 -m agent_flow.cli resource-define chrome_profile \
+  "QA Chrome" --campaign CAMPAIGN_ID --by USERNAME \
+  --configuration \
+  '{"user_data_dir":"/absolute/chrome-user-data","profile_directory":"Default"}'
+
+PYTHONPATH=src python3 -m agent_flow.cli resource-define tenant_database \
+  "QA tenant" --campaign CAMPAIGN_ID --by USERNAME \
+  --configuration \
+  '{"tenant_key":"tenant-qa","database_name":"tenant_qa","connection_env":"TENANT_QA_DATABASE"}'
+
+PYTHONPATH=src python3 -m agent_flow.cli resource-define queue_environment \
+  "QA queues" --campaign CAMPAIGN_ID --by USERNAME \
+  --policy shared --concurrency-limit 2 --configuration \
+  '{"environment_key":"qa","queue_names":["default"],"connection_env":"QUEUE_QA_CONFIG"}'
+
+PYTHONPATH=src python3 -m agent_flow.cli resource-define test_fixture \
+  "Disposable proof" --campaign CAMPAIGN_ID --by USERNAME \
+  --configuration \
+  '{"fixture_key":"proof","root_path":"/private/tmp/agent-flow-proof","disposable":true}'
+```
+
+Definitions default to an exclusive capacity of one. Shared definitions require
+an explicit limit of at least two. Configuration accepts environment-key
+references, never secret values: passwords, tokens, cookies, sensitive fields,
+and credential-bearing URLs are rejected before persistence.
+
+List or inspect definitions read-only, then use the returned exact `res_...` ID
+for job references and mutations. Labels are display text and are never
+mutation identifiers:
+
+```bash
+PYTHONPATH=src python3 -m agent_flow.cli resource-list --campaign CAMPAIGN_ID
+PYTHONPATH=src python3 -m agent_flow.cli resource-show RESOURCE_DEFINITION_ID
+PYTHONPATH=src python3 -m agent_flow.cli resource-disable \
+  RESOURCE_DEFINITION_ID --by USERNAME
+PYTHONPATH=src python3 -m agent_flow.cli resource-enable \
+  RESOURCE_DEFINITION_ID --by USERNAME
 ```
 
 View persisted state without changing it:
@@ -229,6 +293,20 @@ remove the worktree while retaining its branch:
 PYTHONPATH=src python3 -m agent_flow.cli worktree-cleanup WORKTREE_ID
 ```
 
+Request scheduler-owned cancellation by the exact current lease fence, then
+authorize the exact persisted session only if an operator chooses to resume it:
+
+```bash
+PYTHONPATH=src python3 -m agent_flow.cli operator-interrupt JOB_ID \
+  --lease-token EXACT_TOKEN --by OPERATOR --reason "bounded stop"
+PYTHONPATH=src python3 -m agent_flow.cli operator-resume JOB_ID ATTEMPT_ID \
+  --provider codex --session-id EXACT_SESSION --by OPERATOR
+```
+
+The CLI records requests; it never directly signals a PID. The running
+scheduler cancels its own worker, the adapter reaps the exact process group,
+and storage applies the interrupt transaction only after reap proof.
+
 Run the live-provider acceptance proof only with explicit acknowledgement. It
 accepts no repository, database, worktree, or command paths, invokes Codex only
 for investigation and fixing, and retains its private
@@ -252,6 +330,11 @@ PYTHONPATH=src python3 -m agent_flow.cli simulate \
 - Runtime state defaults to `~/.agent-flow/agent-flow.sqlite3`.
 - `status` and `watch` open existing state in SQLite `mode=ro` with
   `query_only=ON`; they fail closed on an outdated schema instead of migrating.
+- Registered resource definitions contain typed identity/configuration,
+  display-safe metadata, scope, and capacity policy; live owner/token/expiry
+  fences remain in the separate resource-lease table.
+- Resource lifecycle events disclose IDs, labels, kinds, policy, and lease
+  slots, but never persisted configuration or browser/database credentials.
 - Tests and temporary demonstrations use `/private/tmp`.
 - Target repositories never receive Agent Flow runtime databases or evidence
   files.

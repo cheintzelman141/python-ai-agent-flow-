@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 import time
@@ -21,6 +22,8 @@ from agent_flow.models import (
     GateProof,
     GateResult,
     InvestigationHandoff,
+    ResourceKind,
+    ResourcePolicyMode,
     TestHandoff as TesterHandoff,
     TestOutcome,
     WorkerRole,
@@ -104,6 +107,18 @@ def _watch_renderable(
             snapshot.get("omitted_open_job_count", 0)
         ),
     )
+
+
+def _json_object(value: str, option_name: str) -> Mapping[str, Any]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as error:
+        raise typer.BadParameter(
+            "%s must contain valid JSON: %s" % (option_name, error)
+        ) from error
+    if not isinstance(parsed, dict):
+        raise typer.BadParameter("%s must contain a JSON object" % option_name)
+    return parsed
 
 
 def _worktree_manager(
@@ -240,6 +255,150 @@ def approve_writes(
     console.print(resolved["id"])
 
 
+@app.command("resource-define")
+def resource_define(
+    kind: ResourceKind = typer.Argument(...),
+    label: str = typer.Argument(...),
+    configuration: str = typer.Option(..., "--configuration"),
+    actor: str = typer.Option(..., "--by"),
+    campaign_id: Optional[str] = typer.Option(None, "--campaign"),
+    metadata: str = typer.Option("{}", "--metadata"),
+    policy_mode: ResourcePolicyMode = typer.Option(
+        ResourcePolicyMode.EXCLUSIVE, "--policy"
+    ),
+    concurrency_limit: int = typer.Option(
+        1, "--concurrency-limit", min=1, max=128
+    ),
+    enabled: bool = typer.Option(True, "--enabled/--disabled"),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Register a typed resource definition without touching the resource."""
+
+    try:
+        with SQLiteStore(_database_path(database)) as store:
+            resource = store.define_resource(
+                kind.value,
+                label,
+                _json_object(configuration, "--configuration"),
+                actor=actor,
+                policy={
+                    "mode": policy_mode.value,
+                    "limit": concurrency_limit,
+                },
+                campaign_id=campaign_id,
+                metadata=_json_object(metadata, "--metadata"),
+                enabled=enabled,
+            )
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(resource["id"])
+
+
+@app.command("resource-list")
+def resource_list(
+    campaign_id: Optional[str] = typer.Option(None, "--campaign"),
+    kind: Optional[ResourceKind] = typer.Option(None, "--kind"),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """List registered resources without exposing runtime credentials or sessions."""
+
+    try:
+        with _open_existing(database, read_only=True) as store:
+            resources = store.list_resource_definitions(
+                campaign_id=campaign_id,
+                kind=None if kind is None else kind.value,
+            )
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    table = Table(title="Registered resources")
+    table.add_column("Exact ID", no_wrap=True)
+    table.add_column("Definition")
+    table.add_column("Status / scope")
+    table.add_column("Policy")
+    for resource in resources:
+        table.add_row(
+            str(resource["id"]),
+            "%s\n%s" % (resource["label"], resource["kind"]),
+            "%s\n%s"
+            % (
+                "enabled" if resource["enabled"] else "disabled",
+                resource["campaign_id"] or "global",
+            ),
+            "%s / %s"
+            % (resource["policy"]["mode"], resource["policy"]["limit"]),
+        )
+    if not resources:
+        table.add_row("None", "-", "-", "-")
+    console.print(table)
+
+
+@app.command("resource-show")
+def resource_show(
+    resource_id: str = typer.Argument(...),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Show one exact registered resource; persisted configuration contains no secrets."""
+
+    try:
+        with _open_existing(database, read_only=True) as store:
+            resource = store.get_resource_definition(resource_id)
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    table = Table(title="Registered resource", show_header=False)
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    for field, value in (
+        ("Exact ID", resource["id"]),
+        ("Kind", resource["kind"]),
+        ("Label", resource["label"]),
+        ("Status", "enabled" if resource["enabled"] else "disabled"),
+        ("Campaign scope", resource["campaign_id"] or "global"),
+        ("Policy", json.dumps(resource["policy"], sort_keys=True)),
+        ("Configuration", json.dumps(resource["configuration"], sort_keys=True)),
+        ("Display metadata", json.dumps(resource["metadata"], sort_keys=True)),
+    ):
+        table.add_row(str(field), str(value))
+    console.print(table)
+
+
+def _set_resource_status(
+    resource_id: str,
+    enabled: bool,
+    actor: str,
+    database: Optional[Path],
+) -> None:
+    try:
+        with _open_existing(database) as store:
+            resource = store.set_resource_enabled(
+                resource_id, enabled, actor=actor
+            )
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(resource["id"])
+
+
+@app.command("resource-enable")
+def resource_enable(
+    resource_id: str = typer.Argument(...),
+    actor: str = typer.Option(..., "--by"),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Enable one resource by its exact opaque ID."""
+
+    _set_resource_status(resource_id, True, actor, database)
+
+
+@app.command("resource-disable")
+def resource_disable(
+    resource_id: str = typer.Argument(...),
+    actor: str = typer.Option(..., "--by"),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Disable one resource by its exact opaque ID."""
+
+    _set_resource_status(resource_id, False, actor, database)
+
+
 @app.command("status")
 def status(
     campaign_id: str = typer.Argument(...),
@@ -268,6 +427,58 @@ def status(
             )
     except StorageError as error:
         raise typer.BadParameter(str(error)) from error
+
+
+@app.command("operator-interrupt")
+def operator_interrupt(
+    job_id: str = typer.Argument(...),
+    lease_token: str = typer.Option(..., "--lease-token"),
+    actor: str = typer.Option(..., "--by"),
+    reason: str = typer.Option(..., "--reason"),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Request scheduler-owned cancellation of one exact live job fence."""
+
+    try:
+        with _open_existing(database) as store:
+            request = store.request_job_interrupt(
+                job_id,
+                lease_token,
+                requested_by=actor,
+                reason=reason,
+            )
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(request["id"])
+
+
+@app.command("operator-resume")
+def operator_resume(
+    job_id: str = typer.Argument(...),
+    source_attempt_id: str = typer.Argument(...),
+    provider: str = typer.Option(..., "--provider"),
+    session_id: str = typer.Option(..., "--session-id"),
+    actor: str = typer.Option(..., "--by"),
+    reason: str = typer.Option(
+        "resume exact persisted external session", "--reason"
+    ),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+) -> None:
+    """Authorize one exact stopped session for the next logical-job claim."""
+
+    try:
+        with _open_existing(database) as store:
+            request = store.request_job_resume(
+                job_id,
+                source_attempt_id,
+                provider,
+                session_id,
+                requested_by=actor,
+                reason=reason,
+            )
+    except (StorageError, ValueError) as error:
+        raise typer.BadParameter(str(error)) from error
+    console.print(request["id"])
 
 
 @app.command("watch")

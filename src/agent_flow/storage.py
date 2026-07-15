@@ -9,17 +9,21 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import os
 import re
+import shutil
 import sqlite3
 import stat
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence
+from urllib.parse import unquote, urlsplit
 
 from pydantic import ValidationError
 
@@ -31,13 +35,16 @@ from agent_flow.models import (
     InvestigationHandoff,
     InvestigationOutcome,
     ItemState,
+    ResourceDefinition,
+    ResourceDefinitionSpec,
+    ResourceKind,
     TestHandoff,
     WorkspaceKind,
     evaluate_test_handoff,
 )
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 9
 OPEN_JOB_STATUSES = ("pending", "running")
 DEFAULT_REQUIRED_GATES = ("focused_tests", "browser", "database")
 DEFAULT_ROLE_LIMITS = {"investigator": 2, "fixer": 2, "tester": 2}
@@ -66,6 +73,18 @@ STAGE_NEXT_STATES = {
 }
 VALID_WORKSPACE_KINDS = {kind.value for kind in WorkspaceKind}
 WORKTREE_RESOURCE_PREFIX = "git-worktree:"
+RESOURCE_DEFINITION_PREFIX = "res_"
+RESOURCE_DEFINITION_ID_PATTERN = re.compile(r"^res_[0-9a-f]{32}$")
+_OPAQUE_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+_COLLECTOR_SECRET_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?:api[_-]?key|client[_-]?secret|cookie|password|passwd|secret|token)"
+    r"\s*(?:=|:)\s*\S"
+)
+_COLLECTOR_CREDENTIAL_URI_PATTERN = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s]+@"
+)
+_READ_ONLY_SQL_PATTERN = re.compile(r"SELECT\b", re.IGNORECASE)
 
 
 class StorageError(RuntimeError):
@@ -88,8 +107,188 @@ def _id() -> str:
     return uuid.uuid4().hex
 
 
+def _resource_id() -> str:
+    return RESOURCE_DEFINITION_PREFIX + uuid.uuid4().hex
+
+
+def _operator_text(value: str, name: str, limit: int) -> str:
+    if (
+        not isinstance(value, str)
+        or value != value.strip()
+        or not value
+        or len(value) > limit
+        or any(unicodedata.category(character) in ("Cc", "Cf") for character in value)
+        or _COLLECTOR_SECRET_PATTERN.search(value) is not None
+        or _COLLECTOR_CREDENTIAL_URI_PATTERN.search(value) is not None
+    ):
+        raise ValueError("operator %s is invalid or sensitive" % name)
+    return value
+
+
 def _dump(value: Any) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True)
+
+
+def _resource_identity_hash(kind: str, configuration: Mapping[str, Any]) -> str:
+    return hashlib.sha256(
+        _dump(
+            {
+                "kind": kind,
+                "configuration": configuration,
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _resource_definition_hash(
+    resource_id: str, definition: Mapping[str, Any]
+) -> str:
+    return hashlib.sha256(
+        _dump(
+            {
+                "id": resource_id,
+                "kind": definition["kind"],
+                "label": definition["label"],
+                "configuration": definition["configuration"],
+                "campaign_id": definition["campaign_id"],
+                "metadata": definition["metadata"],
+                "policy": definition["policy"],
+            }
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _reject_registered_resource_alias(resource_key: str) -> str:
+    if not isinstance(resource_key, str):
+        raise ValueError("resource key must be a string")
+    if resource_key.strip().startswith(RESOURCE_DEFINITION_PREFIX):
+        raise ValueError(
+            "registered resources are managed only through fenced job claims"
+        )
+    return resource_key
+
+
+def _sha256_json(value: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_dump(value).encode("utf-8")).hexdigest()
+
+
+def _reject_unsafe_collector_text(
+    value: Any, label: str, *, allow_newlines: bool = False
+) -> str:
+    if not isinstance(value, str) or not value or len(value) > 16_384:
+        raise ValueError("%s must be a bounded non-empty string" % label)
+    if value != value.strip():
+        raise ValueError("%s must not contain surrounding whitespace" % label)
+    if any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        and not (allow_newlines and character == "\n")
+        for character in value
+    ):
+        raise ValueError("%s contains prohibited control characters" % label)
+    if _COLLECTOR_SECRET_PATTERN.search(value):
+        raise ValueError("%s contains an obvious credential assignment" % label)
+    if _COLLECTOR_CREDENTIAL_URI_PATTERN.search(value):
+        raise ValueError("%s contains a credential-bearing URI" % label)
+    return value
+
+
+def _private_collector_root(value: Any, label: str) -> Path:
+    try:
+        supplied_text = os.fspath(value)
+    except TypeError as error:
+        raise ValueError("%s must be an absolute path" % label) from error
+    text = _reject_unsafe_collector_text(supplied_text, label)
+    supplied = Path(text).expanduser()
+    if not supplied.is_absolute():
+        raise ValueError("%s must be an absolute path" % label)
+    resolved = supplied.resolve()
+    if str(supplied) != str(resolved):
+        raise ValueError("%s must be a canonical path" % label)
+    if not str(resolved).startswith("/private/tmp/agent-flow-"):
+        raise ValueError("%s must be under /private/tmp/agent-flow-*" % label)
+    try:
+        details = resolved.lstat()
+    except OSError as error:
+        raise ValueError("%s must be an existing private directory" % label) from error
+    if (
+        not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise ValueError("%s must be a private user-owned directory" % label)
+    return resolved
+
+
+def _exact_disposable_file_route(value: Any) -> str:
+    route = _reject_unsafe_collector_text(value, "browser route")
+    parsed = urlsplit(route)
+    if (
+        parsed.scheme != "file"
+        or parsed.netloc not in ("", "localhost")
+        or parsed.query
+        or parsed.fragment
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(
+            "browser collector currently supports exact disposable file routes only"
+        )
+    route_path = Path(unquote(parsed.path)).resolve()
+    if not str(route_path).startswith("/private/tmp/agent-flow-"):
+        raise ValueError("browser route must be under /private/tmp/agent-flow-*")
+    return route
+
+
+def _read_only_statement(value: Any) -> str:
+    statement = _reject_unsafe_collector_text(
+        value, "database statement", allow_newlines=False
+    )
+    if (
+        not _READ_ONLY_SQL_PATTERN.match(statement)
+        or ";" in statement
+        or "--" in statement
+        or "/*" in statement
+        or "*/" in statement
+        or "#" in statement
+    ):
+        raise ValueError(
+            "database statement must be one comment-free SELECT without a terminator"
+        )
+    return statement
+
+
+def _bounded_query_parameters(value: Sequence[Any]) -> List[Any]:
+    if isinstance(value, (str, bytes)) or len(value) > 64:
+        raise ValueError("database parameters must be a bounded sequence")
+    parameters: List[Any] = []
+    for parameter in value:
+        if parameter is not None and not isinstance(
+            parameter, (str, int, float, bool)
+        ):
+            raise ValueError("database parameters must contain only scalar values")
+        if isinstance(parameter, float) and not math.isfinite(parameter):
+            raise ValueError("database parameters must contain finite numbers")
+        if isinstance(parameter, str):
+            _reject_unsafe_collector_text(parameter, "database parameter")
+            if len(parameter) > 1_024:
+                raise ValueError("database parameters must be bounded")
+        parameters.append(parameter)
+    return parameters
+
+
+def _bounded_expected_ids(value: Sequence[Any]) -> List[Any]:
+    if isinstance(value, (str, bytes)) or len(value) > 256:
+        raise ValueError("expected database IDs must be a bounded sequence")
+    expected: List[Any] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, (str, int)):
+            raise ValueError("expected database IDs must be strings or integers")
+        if isinstance(item, str):
+            _reject_unsafe_collector_text(item, "expected database ID")
+        expected.append(item)
+    if len({_dump(item) for item in expected}) != len(expected):
+        raise ValueError("expected database IDs must be unique")
+    return expected
 
 
 def _load(value: Optional[str], default: Any) -> Any:
@@ -167,12 +366,15 @@ class SQLiteStore:
 
     _JSON_COLUMNS = {
         "config_json": "config",
+        "configuration_json": "configuration",
+        "policy_json": "policy",
         "role_limits_json": "role_limits",
         "metadata_json": "metadata",
         "required_gates_json": "required_gates",
         "payload_json": "payload",
         "result_json": "result",
         "required_resources_json": "required_resources",
+        "expected_resources_json": "expected_resources",
         "event_data_json": "event_data",
         "scope_json": "scope",
         "source_snapshot_json": "source_snapshot",
@@ -184,6 +386,11 @@ class SQLiteStore:
         "workspace_manifest_before_json": "workspace_manifest_before",
         "workspace_manifest_after_json": "workspace_manifest_after",
         "canonical_handoff_json": "canonical_handoff",
+        "assertions_json": "assertions",
+        "parameters_json": "parameters",
+        "expected_ids_json": "expected_ids",
+        "observed_ids_json": "observed_ids",
+        "read_only_proof_json": "read_only_proof",
     }
 
     def __init__(
@@ -317,6 +524,17 @@ class SQLiteStore:
                 for statement in _SCHEMA_V7:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version = 7")
+                version = 7
+            if version == 7:
+                for statement in _SCHEMA_V8:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 8")
+                version = 8
+            if version == 8:
+                for statement in _SCHEMA_V9:
+                    connection.execute(statement)
+                self._migrate_resource_definition_integrity(connection)
+                connection.execute("PRAGMA user_version = 9")
 
     @staticmethod
     def _migrate_workspace_kinds(connection: sqlite3.Connection) -> None:
@@ -342,6 +560,72 @@ class SQLiteStore:
                 (workspace_kind, job["id"]),
             )
 
+    def _migrate_resource_definition_integrity(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        rows = connection.execute(
+            "SELECT * FROM resource_definitions ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            record = self._row(row)
+            try:
+                spec = ResourceDefinitionSpec.model_validate(
+                    {
+                        field: record[field]
+                        for field in (
+                            "kind",
+                            "label",
+                            "enabled",
+                            "configuration",
+                            "campaign_id",
+                            "metadata",
+                            "policy",
+                        )
+                    }
+                )
+            except ValidationError as error:
+                raise StorageError(
+                    "cannot migrate malformed resource definition %s: %s"
+                    % (row["id"], self._safe_validation_summary(error))
+                ) from error
+            canonical = spec.model_dump(mode="json")
+            for field in (
+                "kind",
+                "label",
+                "enabled",
+                "configuration",
+                "campaign_id",
+                "metadata",
+                "policy",
+            ):
+                if record[field] != canonical[field]:
+                    raise StorageError(
+                        "cannot migrate non-canonical resource definition %s"
+                        % row["id"]
+                    )
+            identity_hash = _resource_identity_hash(
+                canonical["kind"], canonical["configuration"]
+            )
+            if identity_hash != record["identity_hash"]:
+                raise StorageError(
+                    "cannot migrate resource definition %s with identity drift"
+                    % row["id"]
+                )
+            definition_hash = _resource_definition_hash(
+                str(row["id"]), canonical
+            )
+            connection.execute(
+                "UPDATE resource_definitions SET definition_hash = ? WHERE id = ?",
+                (definition_hash, row["id"]),
+            )
+        connection.execute(
+            """UPDATE resource_leases
+               SET resource_identity_hash = (
+                   SELECT identity_hash FROM resource_definitions definition
+                   WHERE definition.id = resource_leases.resource_definition_id)
+               WHERE resource_definition_id IS NOT NULL"""
+        )
+
     def _row(self, row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
         if row is None:
             return None
@@ -364,6 +648,8 @@ class SQLiteStore:
         if isinstance(event_data, Mapping):
             data.setdefault("from_state", event_data.get("from_state"))
             data.setdefault("to_state", event_data.get("to_state"))
+        if "enabled" in data:
+            data["enabled"] = bool(data["enabled"])
         return data
 
     def _rows(self, rows: Sequence[sqlite3.Row]) -> List[Dict[str, Any]]:
@@ -465,6 +751,1751 @@ class SQLiteStore:
         if row is None:
             raise NotFoundError("campaign %s not found" % campaign_id)
         return self._row(row)  # type: ignore[return-value]
+
+    @staticmethod
+    def _exact_resource_definition_id(resource_id: str) -> str:
+        if (
+            not isinstance(resource_id, str)
+            or RESOURCE_DEFINITION_ID_PATTERN.fullmatch(resource_id) is None
+        ):
+            raise ValueError(
+                "resource definition mutations require an exact res_<32 hex> ID"
+            )
+        return resource_id
+
+    @staticmethod
+    def _safe_validation_summary(error: ValidationError) -> str:
+        messages: List[str] = []
+        for detail in error.errors(include_url=False, include_input=False):
+            safe_location_parts = []
+            for part in detail.get("loc", ()):
+                component = str(part)
+                safe_location_parts.append(
+                    component
+                    if re.fullmatch(r"[A-Za-z0-9_]+", component)
+                    else "field"
+                )
+            location = ".".join(safe_location_parts)
+            message = str(detail.get("msg", "validation failed"))
+            messages.append(
+                "%s: %s" % (location, message) if location else message
+            )
+        return "; ".join(messages) or "validation failed"
+
+    def _validated_resource_definition_row(
+        self, row: sqlite3.Row
+    ) -> Dict[str, Any]:
+        try:
+            record = self._row(row)
+            definition = ResourceDefinition.model_validate(record)
+        except ValidationError as error:
+            raise StorageError(
+                "persisted resource definition %s is malformed: %s"
+                % (row["id"], self._safe_validation_summary(error))
+            ) from error
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise StorageError(
+                "persisted resource definition %s is malformed" % row["id"]
+            ) from error
+        canonical = definition.model_dump(mode="json")
+        for field in (
+            "id",
+            "kind",
+            "label",
+            "enabled",
+            "configuration",
+            "campaign_id",
+            "metadata",
+            "policy",
+            "identity_hash",
+            "definition_hash",
+        ):
+            if record[field] != canonical[field]:
+                raise StorageError(
+                    "persisted resource definition %s is not canonical"
+                    % row["id"]
+                )
+        expected_identity_hash = _resource_identity_hash(
+            str(record["kind"]), record["configuration"]
+        )
+        if expected_identity_hash != record["identity_hash"]:
+            raise StorageError(
+                "persisted resource definition %s identity hash does not match its configuration"
+                % row["id"]
+            )
+        if _resource_definition_hash(str(row["id"]), record) != record[
+            "definition_hash"
+        ]:
+            raise StorageError(
+                "persisted resource definition %s immutable fields changed"
+                % row["id"]
+            )
+        return record  # type: ignore[return-value]
+
+    def define_resource(
+        self,
+        kind: str,
+        label: str,
+        configuration: Mapping[str, Any],
+        *,
+        actor: str,
+        policy: Optional[Mapping[str, Any]] = None,
+        campaign_id: Optional[str] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+        enabled: bool = True,
+        resource_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Persist one typed resource definition without touching its resource."""
+
+        actor = _operator_text(actor, "resource mutation actor", 256)
+        if not isinstance(enabled, bool):
+            raise ValueError("resource enabled status must be a boolean")
+        resource_id = (
+            _resource_id()
+            if resource_id is None
+            else self._exact_resource_definition_id(resource_id)
+        )
+        try:
+            spec = ResourceDefinitionSpec.model_validate(
+                {
+                    "kind": _value(kind).lower(),
+                    "label": label,
+                    "enabled": enabled,
+                    "configuration": dict(configuration),
+                    "campaign_id": campaign_id,
+                    "metadata": dict(metadata or {}),
+                    "policy": dict(
+                        policy or {"mode": "exclusive", "limit": 1}
+                    ),
+                }
+            )
+        except ValidationError as error:
+            raise ValueError(
+                "invalid resource definition: %s"
+                % self._safe_validation_summary(error)
+            ) from error
+        data = spec.model_dump(mode="json")
+        identity_hash = _resource_identity_hash(
+            data["kind"], data["configuration"]
+        )
+        definition_hash = _resource_definition_hash(resource_id, data)
+        now = self._clock()
+        with self._transaction() as connection:
+            if campaign_id is not None:
+                campaign = connection.execute(
+                    "SELECT id FROM campaigns WHERE id = ?", (campaign_id,)
+                ).fetchone()
+                if campaign is None:
+                    raise NotFoundError("campaign %s not found" % campaign_id)
+            duplicate = connection.execute(
+                """SELECT id FROM resource_definitions
+                   WHERE kind = ? AND identity_hash = ?""",
+                (data["kind"], identity_hash),
+            ).fetchone()
+            if duplicate is not None:
+                raise TransitionConflict(
+                    "resource identity is already registered as %s"
+                    % duplicate["id"]
+                )
+            existing_id = connection.execute(
+                "SELECT 1 FROM resource_definitions WHERE id = ?",
+                (resource_id,),
+            ).fetchone()
+            if existing_id is not None:
+                raise TransitionConflict(
+                    "resource definition ID already exists: %s" % resource_id
+                )
+            connection.execute(
+                """INSERT INTO resource_definitions
+                   (id, kind, label, enabled, configuration_json, campaign_id,
+                    metadata_json, policy_json, identity_hash, definition_hash,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resource_id,
+                    data["kind"],
+                    data["label"],
+                    1 if data["enabled"] else 0,
+                    _dump(data["configuration"]),
+                    data["campaign_id"],
+                    _dump(data["metadata"]),
+                    _dump(data["policy"]),
+                    identity_hash,
+                    definition_hash,
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "resource.defined",
+                campaign_id=campaign_id,
+                actor=actor,
+                event_data={
+                    "resource_id": resource_id,
+                    "kind": data["kind"],
+                    "label": data["label"],
+                    "enabled": data["enabled"],
+                    "policy": data["policy"],
+                    "identity_hash": identity_hash,
+                },
+                created_at=now,
+            )
+        return self.get_resource_definition(resource_id)
+
+    def get_resource_definition(self, resource_id: str) -> Dict[str, Any]:
+        resource_id = self._exact_resource_definition_id(resource_id)
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM resource_definitions WHERE id = ?",
+                (resource_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("resource definition %s not found" % resource_id)
+        return self._validated_resource_definition_row(row)
+
+    def list_resource_definitions(
+        self,
+        *,
+        campaign_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        enabled: Optional[bool] = None,
+        include_global: bool = True,
+    ) -> List[Dict[str, Any]]:
+        clauses: List[str] = []
+        parameters: List[Any] = []
+        if campaign_id is not None:
+            if include_global:
+                clauses.append("(campaign_id IS NULL OR campaign_id = ?)")
+            else:
+                clauses.append("campaign_id = ?")
+            parameters.append(campaign_id)
+        if kind is not None:
+            try:
+                normalized_kind = ResourceKind(_value(kind).lower()).value
+            except ValueError as error:
+                raise ValueError("unsupported resource kind: %s" % kind) from error
+            clauses.append("kind = ?")
+            parameters.append(normalized_kind)
+        if enabled is not None:
+            if not isinstance(enabled, bool):
+                raise ValueError("enabled filter must be a boolean")
+            clauses.append("enabled = ?")
+            parameters.append(1 if enabled else 0)
+        sql = "SELECT * FROM resource_definitions"
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY kind, label, id"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return [self._validated_resource_definition_row(row) for row in rows]
+
+    def set_resource_enabled(
+        self,
+        resource_id: str,
+        enabled: bool,
+        *,
+        actor: str,
+    ) -> Dict[str, Any]:
+        resource_id = self._exact_resource_definition_id(resource_id)
+        if not isinstance(enabled, bool):
+            raise ValueError("resource enabled status must be a boolean")
+        actor = _operator_text(actor, "resource mutation actor", 256)
+        with self._transaction() as connection:
+            now = self._clock()
+            row = connection.execute(
+                "SELECT * FROM resource_definitions WHERE id = ?",
+                (resource_id,),
+            ).fetchone()
+            if row is None:
+                raise NotFoundError("resource definition %s not found" % resource_id)
+            definition = self._validated_resource_definition_row(row)
+            if bool(definition["enabled"]) == enabled:
+                return definition
+            changed = connection.execute(
+                """UPDATE resource_definitions SET enabled = ?, updated_at = ?
+                   WHERE id = ? AND enabled = ?""",
+                (1 if enabled else 0, now, resource_id, 0 if enabled else 1),
+            ).rowcount
+            if changed != 1:
+                raise TransitionConflict("resource enabled status changed concurrently")
+            self._append_event(
+                connection,
+                "resource.enabled" if enabled else "resource.disabled",
+                campaign_id=row["campaign_id"],
+                actor=actor,
+                event_data={
+                    "resource_id": resource_id,
+                    "kind": definition["kind"],
+                    "label": definition["label"],
+                    "enabled": enabled,
+                },
+                created_at=now,
+            )
+        return self.get_resource_definition(resource_id)
+
+    @staticmethod
+    def _exact_collector_id(value: str, label: str) -> str:
+        if not isinstance(value, str) or _OPAQUE_ID_PATTERN.fullmatch(value) is None:
+            raise ValueError("%s requires an exact 32-character opaque ID" % label)
+        return value
+
+    def _collector_plan_binding(
+        self,
+        connection: sqlite3.Connection,
+        work_item_id: str,
+        resource_definition_id: str,
+        *,
+        resource_kind: str,
+        required_gate: str,
+        require_ready_for_test: bool = True,
+    ) -> tuple[sqlite3.Row, Dict[str, Any]]:
+        resource_definition_id = self._exact_resource_definition_id(
+            resource_definition_id
+        )
+        item = connection.execute(
+            """SELECT i.*, c.config_json AS campaign_config_json
+               FROM work_items i JOIN campaigns c ON c.id = i.campaign_id
+               WHERE i.id = ?""",
+            (work_item_id,),
+        ).fetchone()
+        if item is None:
+            raise NotFoundError("work item %s not found" % work_item_id)
+        if required_gate not in _load(item["required_gates_json"], []):
+            raise TransitionConflict(
+                "%s evidence is not required by this work item" % required_gate
+            )
+        if require_ready_for_test and item["state"] != ItemState.READY_FOR_TEST.value:
+            raise TransitionConflict(
+                "collector plans require a ready_for_test work item"
+            )
+        if _load(item["campaign_config_json"], {}).get(
+            "allow_simulated_evidence"
+        ) is True:
+            raise TransitionConflict(
+                "authoritative collector plans cannot use simulated campaigns"
+            )
+        resource_row = connection.execute(
+            "SELECT * FROM resource_definitions WHERE id = ?",
+            (resource_definition_id,),
+        ).fetchone()
+        if resource_row is None:
+            raise NotFoundError(
+                "resource definition %s not found" % resource_definition_id
+            )
+        resource = self._validated_resource_definition_row(resource_row)
+        if not bool(resource["enabled"]):
+            raise TransitionConflict("collector resource definition is disabled")
+        if resource["kind"] != resource_kind:
+            raise TransitionConflict(
+                "%s evidence requires a %s resource"
+                % (required_gate, resource_kind)
+            )
+        if resource["campaign_id"] not in (None, item["campaign_id"]):
+            raise TransitionConflict(
+                "collector resource definition is outside the work item campaign"
+            )
+        return item, resource
+
+    def _validated_browser_plan_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> Dict[str, Any]:
+        record = self._row(row)
+        try:
+            exact_route = _exact_disposable_file_route(record["route"])
+            title = _reject_unsafe_collector_text(
+                record["expected_title"], "expected title"
+            )
+            body = _reject_unsafe_collector_text(
+                record["expected_body_text"],
+                "expected body text",
+                allow_newlines=True,
+            )
+            runtime = _private_collector_root(
+                record["runtime_root"], "browser runtime root"
+            )
+            timeout_seconds = float(record["timeout_seconds"])
+            if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 120:
+                raise ValueError("browser timeout is outside the supported bounds")
+            _item, resource = self._collector_plan_binding(
+                connection,
+                str(record["work_item_id"]),
+                str(record["resource_definition_id"]),
+                resource_kind=ResourceKind.CHROME_PROFILE.value,
+                required_gate=GateKind.BROWSER.value,
+                require_ready_for_test=False,
+            )
+            if resource["identity_hash"] != record["resource_identity_hash"]:
+                raise ValueError("browser resource identity changed after planning")
+            route_path = Path(unquote(urlsplit(exact_route).path))
+            route_details = route_path.lstat()
+            persisted_route = (
+                int(record["route_device"]),
+                int(record["route_inode"]),
+                int(record["route_owner_uid"]),
+                int(record["route_mode"]),
+                int(record["route_nlink"]),
+                int(record["route_bytes"]),
+            )
+            observed_route = (
+                int(route_details.st_dev),
+                int(route_details.st_ino),
+                int(route_details.st_uid),
+                int(route_details.st_mode),
+                int(route_details.st_nlink),
+                int(route_details.st_size),
+            )
+            if observed_route != persisted_route:
+                raise ValueError("browser route file identity changed after planning")
+            route_sha256 = self._hash_file(route_path, route_details)
+            if (
+                _SHA256_PATTERN.fullmatch(str(record["route_sha256"])) is None
+                or route_sha256 != record["route_sha256"]
+            ):
+                raise ValueError("browser route file bytes changed after planning")
+            payload = {
+                "work_item_id": record["work_item_id"],
+                "resource_definition_id": record["resource_definition_id"],
+                "resource_identity_hash": record["resource_identity_hash"],
+                "route": exact_route,
+                "route_identity": {
+                    "device": persisted_route[0],
+                    "inode": persisted_route[1],
+                    "owner_uid": persisted_route[2],
+                    "mode": persisted_route[3],
+                    "nlink": persisted_route[4],
+                    "bytes": persisted_route[5],
+                    "sha256": route_sha256,
+                },
+                "expected_title": title,
+                "expected_body_text": body,
+                "runtime_root": str(runtime),
+                "timeout_seconds": timeout_seconds,
+            }
+            if (
+                _SHA256_PATTERN.fullmatch(str(record["plan_sha256"])) is None
+                or _sha256_json(payload) != record["plan_sha256"]
+            ):
+                raise ValueError("browser plan hash changed after planning")
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise StorageError(
+                "persisted browser evidence plan %s is invalid"
+                % row["id"]
+            ) from error
+        return record
+
+    def _validated_database_plan_row(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> Dict[str, Any]:
+        record = self._row(row)
+        try:
+            sql = _read_only_statement(record["statement"])
+            parameters = _bounded_query_parameters(record["parameters"])
+            id_column = _reject_unsafe_collector_text(
+                record["id_column"], "database ID column"
+            )
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", id_column) is None:
+                raise ValueError("database ID column is invalid")
+            expected_ids = _bounded_expected_ids(record["expected_ids"])
+            expected_row_count = record["expected_row_count"]
+            max_rows = int(record["max_rows"])
+            max_bytes = int(record["max_bytes"])
+            timeout_seconds = float(record["timeout_seconds"])
+            if not 1 <= max_rows <= 1000 or not 1024 <= max_bytes <= 16 * 1024 * 1024:
+                raise ValueError("database plan bounds are invalid")
+            if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 60:
+                raise ValueError("database timeout is invalid")
+            if expected_row_count is not None and not 0 <= int(expected_row_count) <= max_rows:
+                raise ValueError("expected row count exceeds the result bound")
+            if len(expected_ids) > max_rows:
+                raise ValueError("expected IDs exceed the result bound")
+            runtime = _private_collector_root(
+                record["runtime_root"], "database runtime root"
+            )
+            _item, resource = self._collector_plan_binding(
+                connection,
+                str(record["work_item_id"]),
+                str(record["resource_definition_id"]),
+                resource_kind=ResourceKind.TENANT_DATABASE.value,
+                required_gate=GateKind.DATABASE.value,
+                require_ready_for_test=False,
+            )
+            if resource["identity_hash"] != record["resource_identity_hash"]:
+                raise ValueError("database resource identity changed after planning")
+            query_sha256 = _sha256_json(
+                {"statement": sql, "parameters": parameters}
+            )
+            if (
+                _SHA256_PATTERN.fullmatch(str(record["query_sha256"])) is None
+                or query_sha256 != record["query_sha256"]
+            ):
+                raise ValueError("database query hash changed after planning")
+            payload = {
+                "work_item_id": record["work_item_id"],
+                "resource_definition_id": record["resource_definition_id"],
+                "resource_identity_hash": record["resource_identity_hash"],
+                "query_sha256": query_sha256,
+                "id_column": id_column,
+                "expected_ids": expected_ids,
+                "expected_row_count": expected_row_count,
+                "max_rows": max_rows,
+                "max_bytes": max_bytes,
+                "timeout_seconds": timeout_seconds,
+                "runtime_root": str(runtime),
+            }
+            if (
+                _SHA256_PATTERN.fullmatch(str(record["plan_sha256"])) is None
+                or _sha256_json(payload) != record["plan_sha256"]
+            ):
+                raise ValueError("database plan hash changed after planning")
+        except (KeyError, OSError, TypeError, ValueError) as error:
+            raise StorageError(
+                "persisted database query plan %s is invalid" % row["id"]
+            ) from error
+        return record
+
+    def create_browser_evidence_plan(
+        self,
+        work_item_id: str,
+        resource_definition_id: str,
+        *,
+        route: str,
+        expected_title: str,
+        expected_body_text: str,
+        runtime_root: Path,
+        timeout_seconds: float = 30.0,
+    ) -> Dict[str, Any]:
+        """Create one immutable, fixed-action visible-browser evidence plan."""
+
+        exact_route = _exact_disposable_file_route(route)
+        title = _reject_unsafe_collector_text(expected_title, "expected title")
+        body = _reject_unsafe_collector_text(
+            expected_body_text, "expected body text", allow_newlines=True
+        )
+        runtime = _private_collector_root(runtime_root, "browser runtime root")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+            or timeout_seconds > 120
+        ):
+            raise ValueError("browser timeout must be between 0 and 120 seconds")
+        with self._transaction() as connection:
+            now = self._clock()
+            item, resource = self._collector_plan_binding(
+                connection,
+                work_item_id,
+                resource_definition_id,
+                resource_kind=ResourceKind.CHROME_PROFILE.value,
+                required_gate=GateKind.BROWSER.value,
+            )
+            user_data_dir = Path(
+                str(resource["configuration"]["user_data_dir"])
+            ).resolve()
+            if not str(user_data_dir).startswith("/private/tmp/agent-flow-"):
+                raise TransitionConflict(
+                    "the fixed browser collector requires a disposable Chrome profile"
+                )
+            route_path = Path(unquote(urlsplit(exact_route).path))
+            try:
+                route_details = route_path.lstat()
+            except OSError as error:
+                raise ValueError(
+                    "browser route must identify an existing disposable file"
+                ) from error
+            if (
+                not stat.S_ISREG(route_details.st_mode)
+                or route_details.st_uid != os.getuid()
+                or route_details.st_mode & 0o077
+                or route_details.st_nlink != 1
+                or route_details.st_size <= 0
+                or route_details.st_size > 1024 * 1024
+            ):
+                raise ValueError(
+                    "browser route must be a bounded private user-owned regular file"
+                )
+            route_sha256 = self._hash_file(route_path, route_details)
+            plan_payload = {
+                "work_item_id": work_item_id,
+                "resource_definition_id": resource_definition_id,
+                "resource_identity_hash": resource["identity_hash"],
+                "route": exact_route,
+                "route_identity": {
+                    "device": int(route_details.st_dev),
+                    "inode": int(route_details.st_ino),
+                    "owner_uid": int(route_details.st_uid),
+                    "mode": int(route_details.st_mode),
+                    "nlink": int(route_details.st_nlink),
+                    "bytes": int(route_details.st_size),
+                    "sha256": route_sha256,
+                },
+                "expected_title": title,
+                "expected_body_text": body,
+                "runtime_root": str(runtime),
+                "timeout_seconds": float(timeout_seconds),
+            }
+            plan_sha256 = _sha256_json(plan_payload)
+            existing = connection.execute(
+                """SELECT * FROM browser_evidence_plans
+                   WHERE work_item_id = ? AND plan_sha256 = ?""",
+                (work_item_id, plan_sha256),
+            ).fetchone()
+            if existing is not None:
+                return self._validated_browser_plan_row(connection, existing)
+            plan_number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(plan_number), 0) + 1
+                       FROM browser_evidence_plans WHERE work_item_id = ?""",
+                    (work_item_id,),
+                ).fetchone()[0]
+            )
+            plan_id = _id()
+            connection.execute(
+                """INSERT INTO browser_evidence_plans
+                   (id, work_item_id, plan_number, resource_definition_id,
+                    resource_identity_hash, route, route_device, route_inode,
+                    route_owner_uid, route_mode, route_nlink, route_bytes,
+                    route_sha256, expected_title,
+                    expected_body_text, runtime_root, timeout_seconds,
+                    plan_sha256, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_id,
+                    work_item_id,
+                    plan_number,
+                    resource_definition_id,
+                    resource["identity_hash"],
+                    exact_route,
+                    int(route_details.st_dev),
+                    int(route_details.st_ino),
+                    int(route_details.st_uid),
+                    int(route_details.st_mode),
+                    int(route_details.st_nlink),
+                    int(route_details.st_size),
+                    route_sha256,
+                    title,
+                    body,
+                    str(runtime),
+                    float(timeout_seconds),
+                    plan_sha256,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "browser_evidence.plan_created",
+                campaign_id=item["campaign_id"],
+                work_item_id=work_item_id,
+                event_data={
+                    "plan_id": plan_id,
+                    "plan_number": plan_number,
+                    "resource_id": resource_definition_id,
+                    "resource_identity_hash": resource["identity_hash"],
+                    "route": exact_route,
+                    "plan_sha256": plan_sha256,
+                },
+                created_at=now,
+            )
+        return self.get_browser_evidence_plan(plan_id)
+
+    def get_browser_evidence_plan(self, plan_id: str) -> Dict[str, Any]:
+        plan_id = self._exact_collector_id(plan_id, "browser plan")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM browser_evidence_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("browser evidence plan %s not found" % plan_id)
+        return self._validated_browser_plan_row(self._connection, row)
+
+    def list_browser_evidence_plans(
+        self, *, work_item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM browser_evidence_plans"
+        parameters: Sequence[Any] = ()
+        if work_item_id is not None:
+            sql += " WHERE work_item_id = ?"
+            parameters = (work_item_id,)
+        sql += " ORDER BY work_item_id, plan_number"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+            return [
+                self._validated_browser_plan_row(self._connection, row)
+                for row in rows
+            ]
+
+    def create_database_query_plan(
+        self,
+        work_item_id: str,
+        resource_definition_id: str,
+        *,
+        statement: str,
+        parameters: Sequence[Any] = (),
+        id_column: str = "id",
+        expected_ids: Sequence[Any] = (),
+        expected_row_count: Optional[int] = None,
+        max_rows: int = 100,
+        max_bytes: int = 1_048_576,
+        timeout_seconds: float = 5.0,
+        runtime_root: Path,
+    ) -> Dict[str, Any]:
+        """Create one immutable supervisor-owned disposable SQLite query plan."""
+
+        sql = _read_only_statement(statement)
+        bound_parameters = _bounded_query_parameters(parameters)
+        exact_id_column = _reject_unsafe_collector_text(
+            id_column, "database ID column"
+        )
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", exact_id_column) is None:
+            raise ValueError("database ID column must be a safe exact identifier")
+        exact_ids = _bounded_expected_ids(expected_ids)
+        if (
+            expected_row_count is not None
+            and (
+                not isinstance(expected_row_count, int)
+                or isinstance(expected_row_count, bool)
+                or expected_row_count < 0
+                or expected_row_count > 1000
+            )
+        ):
+            raise ValueError("expected row count must be from 0 to 1000")
+        if (
+            not isinstance(max_rows, int)
+            or isinstance(max_rows, bool)
+            or max_rows < 1
+            or max_rows > 1000
+        ):
+            raise ValueError("database max_rows must be from 1 to 1000")
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or max_bytes < 1024
+            or max_bytes > 16 * 1024 * 1024
+        ):
+            raise ValueError("database max_bytes is outside the supported bounds")
+        if expected_row_count is not None and expected_row_count > max_rows:
+            raise ValueError("expected row count cannot exceed max_rows")
+        if len(exact_ids) > max_rows:
+            raise ValueError("expected database IDs cannot exceed max_rows")
+        if (
+            not isinstance(timeout_seconds, (int, float))
+            or isinstance(timeout_seconds, bool)
+            or not math.isfinite(float(timeout_seconds))
+            or timeout_seconds <= 0
+            or timeout_seconds > 60
+        ):
+            raise ValueError("database timeout must be between 0 and 60 seconds")
+        runtime = _private_collector_root(runtime_root, "database runtime root")
+        query_payload = {"statement": sql, "parameters": bound_parameters}
+        query_sha256 = _sha256_json(query_payload)
+        with self._transaction() as connection:
+            now = self._clock()
+            item, resource = self._collector_plan_binding(
+                connection,
+                work_item_id,
+                resource_definition_id,
+                resource_kind=ResourceKind.TENANT_DATABASE.value,
+                required_gate=GateKind.DATABASE.value,
+            )
+            plan_payload = {
+                "work_item_id": work_item_id,
+                "resource_definition_id": resource_definition_id,
+                "resource_identity_hash": resource["identity_hash"],
+                "query_sha256": query_sha256,
+                "id_column": exact_id_column,
+                "expected_ids": exact_ids,
+                "expected_row_count": expected_row_count,
+                "max_rows": max_rows,
+                "max_bytes": max_bytes,
+                "timeout_seconds": float(timeout_seconds),
+                "runtime_root": str(runtime),
+            }
+            plan_sha256 = _sha256_json(plan_payload)
+            existing = connection.execute(
+                """SELECT * FROM database_query_plans
+                   WHERE work_item_id = ? AND plan_sha256 = ?""",
+                (work_item_id, plan_sha256),
+            ).fetchone()
+            if existing is not None:
+                return self._validated_database_plan_row(connection, existing)
+            plan_number = int(
+                connection.execute(
+                    """SELECT COALESCE(MAX(plan_number), 0) + 1
+                       FROM database_query_plans WHERE work_item_id = ?""",
+                    (work_item_id,),
+                ).fetchone()[0]
+            )
+            plan_id = _id()
+            connection.execute(
+                """INSERT INTO database_query_plans
+                   (id, work_item_id, plan_number, resource_definition_id,
+                    resource_identity_hash, statement, parameters_json,
+                    query_sha256, id_column, expected_ids_json, expected_row_count,
+                    max_rows, max_bytes, timeout_seconds, runtime_root,
+                    plan_sha256, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    plan_id,
+                    work_item_id,
+                    plan_number,
+                    resource_definition_id,
+                    resource["identity_hash"],
+                    sql,
+                    _dump(bound_parameters),
+                    query_sha256,
+                    exact_id_column,
+                    _dump(exact_ids),
+                    expected_row_count,
+                    max_rows,
+                    max_bytes,
+                    float(timeout_seconds),
+                    str(runtime),
+                    plan_sha256,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "database_evidence.plan_created",
+                campaign_id=item["campaign_id"],
+                work_item_id=work_item_id,
+                event_data={
+                    "plan_id": plan_id,
+                    "plan_number": plan_number,
+                    "resource_id": resource_definition_id,
+                    "resource_identity_hash": resource["identity_hash"],
+                    "query_sha256": query_sha256,
+                    "plan_sha256": plan_sha256,
+                },
+                created_at=now,
+            )
+        return self.get_database_query_plan(plan_id)
+
+    def get_database_query_plan(self, plan_id: str) -> Dict[str, Any]:
+        plan_id = self._exact_collector_id(plan_id, "database plan")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM database_query_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("database query plan %s not found" % plan_id)
+        return self._validated_database_plan_row(self._connection, row)
+
+    def list_database_query_plans(
+        self, *, work_item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM database_query_plans"
+        parameters: Sequence[Any] = ()
+        if work_item_id is not None:
+            sql += " WHERE work_item_id = ?"
+            parameters = (work_item_id,)
+        sql += " ORDER BY work_item_id, plan_number"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+            return [
+                self._validated_database_plan_row(self._connection, row)
+                for row in rows
+            ]
+
+    def _collector_live_binding(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        work_item_id: str,
+        resource_definition_id: str,
+        now: float,
+    ) -> tuple[sqlite3.Row, sqlite3.Row]:
+        job = self._assert_live_lease(
+            connection, job_id, worker_id, lease_token, now
+        )
+        if (
+            job["role"] != "tester"
+            or job["work_item_id"] != work_item_id
+            or job["current_attempt_id"] is None
+        ):
+            raise LeaseConflict(
+                "collector plan does not match the current tester job and attempt"
+            )
+        attempt = connection.execute(
+            "SELECT * FROM attempts WHERE id = ?",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if attempt is None or attempt["status"] != "running":
+            raise LeaseConflict("current collector attempt is absent")
+        lease = connection.execute(
+            """SELECT 1 FROM resource_leases
+               WHERE job_id = ? AND owner_id = ? AND lease_token = ?
+                 AND resource_key = ? AND resource_definition_id = ?""",
+            (
+                job_id,
+                worker_id,
+                lease_token,
+                resource_definition_id,
+                resource_definition_id,
+            ),
+        ).fetchone()
+        if lease is None:
+            raise LeaseConflict(
+                "collector attempt does not hold the exact registered resource fence"
+            )
+        return job, attempt
+
+    @staticmethod
+    def _assert_stopped_collector_process(
+        connection: sqlite3.Connection,
+        attempt_id: str,
+        provider: str,
+    ) -> None:
+        stopped = connection.execute(
+            """SELECT 1 FROM external_processes
+               WHERE attempt_id = ? AND provider = ? AND state = 'stopped'
+               LIMIT 1""",
+            (attempt_id, provider),
+        ).fetchone()
+        active = connection.execute(
+            """SELECT 1 FROM external_processes
+               WHERE attempt_id = ? AND state != 'stopped' LIMIT 1""",
+            (attempt_id,),
+        ).fetchone()
+        if stopped is None or active is not None:
+            raise LeaseConflict(
+                "%s collector lacks durable process-group reap proof" % provider
+            )
+
+    @staticmethod
+    def _prepare_collector_run_parent(
+        runtime_root: Path, attempt_id: str, collector: str
+    ) -> Path:
+        SQLiteStore._assert_private_directory(runtime_root)
+        attempt_root = runtime_root / attempt_id
+        if attempt_root.exists():
+            SQLiteStore._assert_private_directory(attempt_root)
+        else:
+            SQLiteStore._create_private_directory(attempt_root)
+        run_parent = attempt_root / collector
+        if run_parent.exists() or run_parent.is_symlink():
+            raise LeaseConflict("collector run directory already exists")
+        SQLiteStore._create_private_directory(run_parent)
+        return run_parent
+
+    @contextmanager
+    def _collector_prepare_transaction(
+        self,
+    ) -> Iterator[tuple[sqlite3.Connection, List[Path]]]:
+        created_run_parents: List[Path] = []
+        try:
+            with self._transaction() as connection:
+                yield connection, created_run_parents
+        except BaseException:
+            for run_parent in reversed(created_run_parents):
+                try:
+                    shutil.rmtree(run_parent)
+                    run_parent.parent.rmdir()
+                except OSError:
+                    pass
+            raise
+
+    @staticmethod
+    def _collector_artifact(
+        supplied_path: Any,
+        expected_path: Path,
+        claimed_sha256: Any,
+        *,
+        max_bytes: int,
+    ) -> tuple[os.stat_result, str, bytes]:
+        if not isinstance(supplied_path, str) or supplied_path != str(expected_path):
+            raise LeaseConflict("collector artifact path changed after preparation")
+        if (
+            not isinstance(claimed_sha256, str)
+            or _SHA256_PATTERN.fullmatch(claimed_sha256) is None
+        ):
+            raise ValueError("collector artifact hash must be lowercase SHA-256")
+        try:
+            descriptor = os.open(
+                str(expected_path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+        except OSError as error:
+            raise LeaseConflict("collector artifact is missing") from error
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o077
+                or details.st_nlink != 1
+                or details.st_size <= 0
+                or details.st_size > max_bytes
+            ):
+                raise LeaseConflict(
+                    "collector artifact must be a bounded private user-owned regular file"
+                )
+            chunks: List[bytes] = []
+            remaining = max_bytes + 1
+            while remaining > 0:
+                chunk = os.read(descriptor, min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            after = os.fstat(descriptor)
+            path_details = expected_path.lstat()
+            identity_fields = (
+                "st_dev",
+                "st_ino",
+                "st_uid",
+                "st_mode",
+                "st_nlink",
+                "st_size",
+            )
+            if any(
+                getattr(details, field) != getattr(after, field)
+                or getattr(details, field) != getattr(path_details, field)
+                for field in identity_fields
+            ):
+                raise LeaseConflict("collector artifact changed while it was read")
+        except OSError as error:
+            raise LeaseConflict("collector artifact changed while it was read") from error
+        finally:
+            os.close(descriptor)
+        if len(raw) != details.st_size or len(raw) > max_bytes:
+            raise LeaseConflict("collector artifact changed while it was read")
+        observed_sha256 = hashlib.sha256(raw).hexdigest()
+        if observed_sha256 != claimed_sha256:
+            raise LeaseConflict("collector artifact hash does not match its bytes")
+        return details, observed_sha256, raw
+
+    def prepare_browser_evidence_execution(
+        self,
+        plan_id: str,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+    ) -> Dict[str, Any]:
+        plan_id = self._exact_collector_id(plan_id, "browser plan")
+        with self._collector_prepare_transaction() as (
+            connection,
+            created_run_parents,
+        ):
+            now = self._clock()
+            plan_row = connection.execute(
+                "SELECT * FROM browser_evidence_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            if plan_row is None:
+                raise NotFoundError("browser evidence plan %s not found" % plan_id)
+            plan = self._validated_browser_plan_row(connection, plan_row)
+            job, attempt = self._collector_live_binding(
+                connection,
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=lease_token,
+                work_item_id=str(plan["work_item_id"]),
+                resource_definition_id=str(plan["resource_definition_id"]),
+                now=now,
+            )
+            existing = connection.execute(
+                "SELECT * FROM browser_evidence_executions WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["plan_id"] != plan_id or existing["job_id"] != job_id:
+                    raise LeaseConflict(
+                        "browser execution is already bound to another plan or job"
+                    )
+                return self._browser_execution_contract(
+                    self._row(existing), plan, connection
+                )
+            runtime_root = Path(str(plan["runtime_root"]))
+            run_parent = self._prepare_collector_run_parent(
+                runtime_root, str(attempt["id"]), "browser"
+            )
+            created_run_parents.append(run_parent)
+            screenshot_path = run_parent / "screenshot.png"
+            execution_id = _id()
+            connection.execute(
+                """INSERT INTO browser_evidence_executions
+                   (id, plan_id, attempt_id, job_id, work_item_id,
+                    resource_definition_id, resource_identity_hash, status,
+                    requested_route, run_parent, screenshot_path,
+                    prepared_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)""",
+                (
+                    execution_id,
+                    plan_id,
+                    attempt["id"],
+                    job_id,
+                    job["work_item_id"],
+                    plan["resource_definition_id"],
+                    plan["resource_identity_hash"],
+                    plan["route"],
+                    str(run_parent),
+                    str(screenshot_path),
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "browser_evidence.execution_prepared",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "execution_id": execution_id,
+                    "plan_id": plan_id,
+                    "attempt_id": attempt["id"],
+                    "resource_id": plan["resource_definition_id"],
+                    "resource_identity_hash": plan["resource_identity_hash"],
+                },
+                created_at=now,
+            )
+            execution = self._row(
+                connection.execute(
+                    "SELECT * FROM browser_evidence_executions WHERE id = ?",
+                    (execution_id,),
+                ).fetchone()
+            )
+            return self._browser_execution_contract(execution, plan, connection)
+
+    def _browser_execution_contract(
+        self,
+        execution: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        connection: sqlite3.Connection,
+    ) -> Dict[str, Any]:
+        resource_row = connection.execute(
+            "SELECT * FROM resource_definitions WHERE id = ?",
+            (plan["resource_definition_id"],),
+        ).fetchone()
+        if resource_row is None:
+            raise LeaseConflict("browser collector resource disappeared")
+        resource = self._validated_resource_definition_row(resource_row)
+        if resource["identity_hash"] != plan["resource_identity_hash"]:
+            raise LeaseConflict("browser collector resource identity changed")
+        contract = dict(execution)
+        contract.update(
+            {
+                "route": plan["route"],
+                "expected_title": plan["expected_title"],
+                "expected_body_text": plan["expected_body_text"],
+                "timeout_seconds": plan["timeout_seconds"],
+                "chrome_configuration": dict(resource["configuration"]),
+                "plan_sha256": plan["plan_sha256"],
+            }
+        )
+        return contract
+
+    def complete_browser_evidence_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        execution_id = self._exact_collector_id(
+            str(result.get("execution_id", "")), "browser execution"
+        )
+        observed_route = _exact_disposable_file_route(result.get("observed_route"))
+        observed_title = _reject_unsafe_collector_text(
+            result.get("observed_title"), "observed browser title"
+        )
+        observed_body = _reject_unsafe_collector_text(
+            result.get("observed_body_text"),
+            "observed browser body",
+            allow_newlines=True,
+        )
+        with self._transaction() as connection:
+            now = self._clock()
+            execution_row = connection.execute(
+                "SELECT * FROM browser_evidence_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            if execution_row is None:
+                raise NotFoundError(
+                    "browser evidence execution %s not found" % execution_id
+                )
+            plan_row = connection.execute(
+                "SELECT * FROM browser_evidence_plans WHERE id = ?",
+                (execution_row["plan_id"],),
+            ).fetchone()
+            if plan_row is None:
+                raise LeaseConflict("browser evidence plan disappeared")
+            plan = self._validated_browser_plan_row(connection, plan_row)
+            job, attempt = self._collector_live_binding(
+                connection,
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=lease_token,
+                work_item_id=str(plan["work_item_id"]),
+                resource_definition_id=str(plan["resource_definition_id"]),
+                now=now,
+            )
+            if (
+                execution_row["job_id"] != job_id
+                or execution_row["attempt_id"] != attempt["id"]
+            ):
+                raise LeaseConflict(
+                    "browser execution belongs to another job or attempt"
+                )
+            self._assert_stopped_collector_process(
+                connection, str(attempt["id"]), "browser_evidence"
+            )
+            screenshot_path = Path(str(execution_row["screenshot_path"]))
+            details, screenshot_sha256, _screenshot_bytes = self._collector_artifact(
+                result.get("screenshot_path"),
+                screenshot_path,
+                result.get("screenshot_sha256"),
+                max_bytes=16 * 1024 * 1024,
+            )
+            assertions = {
+                "route": observed_route == plan["route"],
+                "title": observed_title == plan["expected_title"],
+                "body": observed_body == plan["expected_body_text"],
+            }
+            observed_body_sha256 = hashlib.sha256(
+                observed_body.encode("utf-8")
+            ).hexdigest()
+            outcome = "pass" if all(assertions.values()) else "fail"
+            if execution_row["status"] == "finished":
+                persisted = self._row(execution_row)
+                if (
+                    persisted["observed_route"] != observed_route
+                    or persisted["observed_title"] != observed_title
+                    or persisted["observed_body_sha256"] != observed_body_sha256
+                    or persisted["assertions"] != assertions
+                    or persisted["screenshot_sha256"] != screenshot_sha256
+                    or persisted["outcome"] != outcome
+                ):
+                    raise LeaseConflict("finished browser evidence changed")
+                return persisted
+            if execution_row["status"] != "prepared":
+                raise LeaseConflict("browser evidence execution is not completable")
+            artifact_id = _id()
+            connection.execute(
+                """INSERT INTO artifacts
+                   (id, work_item_id, job_id, attempt_id, kind, uri,
+                    metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, 'browser_screenshot', ?, ?, ?)""",
+                (
+                    artifact_id,
+                    job["work_item_id"],
+                    job_id,
+                    execution_row["attempt_id"],
+                    str(screenshot_path),
+                    _dump(
+                        {
+                            "attempt_id": execution_row["attempt_id"],
+                            "execution_id": execution_id,
+                            "resource_id": plan["resource_definition_id"],
+                            "sha256": screenshot_sha256,
+                            "bytes": int(details.st_size),
+                        }
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE browser_evidence_executions
+                   SET status = 'finished', outcome = ?, observed_route = ?,
+                       observed_title = ?, observed_body_sha256 = ?,
+                       assertions_json = ?,
+                       screenshot_device = ?, screenshot_inode = ?,
+                       screenshot_owner_uid = ?, screenshot_mode = ?,
+                       screenshot_nlink = ?, screenshot_bytes = ?,
+                       screenshot_sha256 = ?, artifact_id = ?, finished_at = ?,
+                       updated_at = ?
+                   WHERE id = ? AND status = 'prepared'""",
+                (
+                    outcome,
+                    observed_route,
+                    observed_title,
+                    observed_body_sha256,
+                    _dump(assertions),
+                    int(details.st_dev),
+                    int(details.st_ino),
+                    int(details.st_uid),
+                    int(details.st_mode),
+                    int(details.st_nlink),
+                    int(details.st_size),
+                    screenshot_sha256,
+                    artifact_id,
+                    now,
+                    now,
+                    execution_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                "artifact.added",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "artifact_id": artifact_id,
+                    "attempt_id": execution_row["attempt_id"],
+                    "kind": "browser_screenshot",
+                    "uri": str(screenshot_path),
+                },
+                created_at=now,
+            )
+            self._append_event(
+                connection,
+                "browser_evidence.execution_finished",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "execution_id": execution_id,
+                    "plan_id": plan["id"],
+                    "attempt_id": execution_row["attempt_id"],
+                    "resource_id": plan["resource_definition_id"],
+                    "outcome": outcome,
+                    "screenshot_sha256": screenshot_sha256,
+                },
+                created_at=now,
+            )
+            finished = connection.execute(
+                "SELECT * FROM browser_evidence_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            return self._row(finished)  # type: ignore[return-value]
+
+    def get_browser_evidence_execution(self, execution_id: str) -> Dict[str, Any]:
+        execution_id = self._exact_collector_id(execution_id, "browser execution")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM browser_evidence_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("browser evidence execution %s not found" % execution_id)
+        return self._row(row)  # type: ignore[return-value]
+
+    def list_browser_evidence_executions(
+        self, *, work_item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM browser_evidence_executions"
+        parameters: Sequence[Any] = ()
+        if work_item_id is not None:
+            sql += " WHERE work_item_id = ?"
+            parameters = (work_item_id,)
+        sql += " ORDER BY work_item_id, prepared_at, id"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return self._rows(rows)
+
+    def prepare_database_query_execution(
+        self,
+        plan_id: str,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+    ) -> Dict[str, Any]:
+        plan_id = self._exact_collector_id(plan_id, "database plan")
+        with self._collector_prepare_transaction() as (
+            connection,
+            created_run_parents,
+        ):
+            now = self._clock()
+            plan_row = connection.execute(
+                "SELECT * FROM database_query_plans WHERE id = ?", (plan_id,)
+            ).fetchone()
+            if plan_row is None:
+                raise NotFoundError("database query plan %s not found" % plan_id)
+            plan = self._validated_database_plan_row(connection, plan_row)
+            job, attempt = self._collector_live_binding(
+                connection,
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=lease_token,
+                work_item_id=str(plan["work_item_id"]),
+                resource_definition_id=str(plan["resource_definition_id"]),
+                now=now,
+            )
+            existing = connection.execute(
+                "SELECT * FROM database_query_executions WHERE attempt_id = ?",
+                (attempt["id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing["plan_id"] != plan_id or existing["job_id"] != job_id:
+                    raise LeaseConflict(
+                        "database execution is already bound to another plan or job"
+                    )
+                return self._database_execution_contract(
+                    self._row(existing), plan, connection
+                )
+            runtime_root = Path(str(plan["runtime_root"]))
+            run_parent = self._prepare_collector_run_parent(
+                runtime_root, str(attempt["id"]), "database"
+            )
+            created_run_parents.append(run_parent)
+            result_path = run_parent / "result.json"
+            execution_id = _id()
+            connection.execute(
+                """INSERT INTO database_query_executions
+                   (id, plan_id, attempt_id, job_id, work_item_id,
+                    resource_definition_id, resource_identity_hash, status,
+                    query_sha256, run_parent, result_path, prepared_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, 'prepared', ?, ?, ?, ?, ?)""",
+                (
+                    execution_id,
+                    plan_id,
+                    attempt["id"],
+                    job_id,
+                    job["work_item_id"],
+                    plan["resource_definition_id"],
+                    plan["resource_identity_hash"],
+                    plan["query_sha256"],
+                    str(run_parent),
+                    str(result_path),
+                    now,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "database_evidence.execution_prepared",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "execution_id": execution_id,
+                    "plan_id": plan_id,
+                    "attempt_id": attempt["id"],
+                    "resource_id": plan["resource_definition_id"],
+                    "resource_identity_hash": plan["resource_identity_hash"],
+                    "query_sha256": plan["query_sha256"],
+                },
+                created_at=now,
+            )
+            execution = self._row(
+                connection.execute(
+                    "SELECT * FROM database_query_executions WHERE id = ?",
+                    (execution_id,),
+                ).fetchone()
+            )
+            return self._database_execution_contract(execution, plan, connection)
+
+    def _database_execution_contract(
+        self,
+        execution: Mapping[str, Any],
+        plan: Mapping[str, Any],
+        connection: sqlite3.Connection,
+    ) -> Dict[str, Any]:
+        resource_row = connection.execute(
+            "SELECT * FROM resource_definitions WHERE id = ?",
+            (plan["resource_definition_id"],),
+        ).fetchone()
+        if resource_row is None:
+            raise LeaseConflict("database collector resource disappeared")
+        resource = self._validated_resource_definition_row(resource_row)
+        if resource["identity_hash"] != plan["resource_identity_hash"]:
+            raise LeaseConflict("database collector resource identity changed")
+        contract = dict(execution)
+        contract.update(
+            {
+                "statement": plan["statement"],
+                "parameters": list(plan["parameters"]),
+                "id_column": plan["id_column"],
+                "expected_ids": list(plan["expected_ids"]),
+                "expected_row_count": plan["expected_row_count"],
+                "max_rows": plan["max_rows"],
+                "max_bytes": plan["max_bytes"],
+                "timeout_seconds": plan["timeout_seconds"],
+                "database_configuration": dict(resource["configuration"]),
+                "plan_sha256": plan["plan_sha256"],
+            }
+        )
+        return contract
+
+    @staticmethod
+    def _validated_database_result(
+        raw: bytes, max_rows: int, max_bytes: int, id_column: str
+    ) -> tuple[Dict[str, Any], List[Any]]:
+        if len(raw) > max_bytes:
+            raise LeaseConflict("database result exceeded its byte bound")
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise LeaseConflict("database result is not valid JSON") from error
+        if not isinstance(payload, dict) or set(payload) != {
+            "columns",
+            "rows",
+            "read_only_proof",
+        }:
+            raise LeaseConflict("database result has an unexpected structure")
+        if raw != _dump(payload).encode("utf-8"):
+            raise LeaseConflict("database result is not canonical JSON")
+        columns = payload["columns"]
+        rows = payload["rows"]
+        proof = payload["read_only_proof"]
+        if (
+            not isinstance(columns, list)
+            or not columns
+            or len(columns) > 64
+            or any(
+                not isinstance(column, str)
+                or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,127}", column) is None
+                for column in columns
+            )
+            or len(set(columns)) != len(columns)
+        ):
+            raise LeaseConflict("database result columns are invalid")
+        if id_column not in columns:
+            raise LeaseConflict("database result omitted the exact ID column")
+        if not isinstance(rows, list) or len(rows) > max_rows:
+            raise LeaseConflict("database result exceeded its row bound")
+        id_index = columns.index(id_column)
+        observed_ids: List[Any] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) != len(columns):
+                raise LeaseConflict("database result rows do not match the columns")
+            for value in row:
+                if value is not None and not isinstance(
+                    value, (str, int, float, bool)
+                ):
+                    raise LeaseConflict("database result contains a non-scalar value")
+                if isinstance(value, float) and not math.isfinite(value):
+                    raise LeaseConflict("database result contains a non-finite value")
+                if isinstance(value, str):
+                    _reject_unsafe_collector_text(
+                        value, "database result value", allow_newlines=True
+                    )
+            observed_id = row[id_index]
+            if isinstance(observed_id, bool) or not isinstance(
+                observed_id, (str, int)
+            ):
+                raise LeaseConflict("database result ID values are invalid")
+            observed_ids.append(observed_id)
+        if (
+            not isinstance(proof, dict)
+            or set(proof) != {
+                "authorizer",
+                "foreign_key_violations",
+                "query_only",
+                "uri_mode",
+            }
+            or proof.get("authorizer") != "deny_non_read"
+            or proof.get("query_only") is not True
+            or proof.get("uri_mode") != "ro"
+            or not isinstance(proof.get("foreign_key_violations"), int)
+            or isinstance(proof.get("foreign_key_violations"), bool)
+            or int(proof["foreign_key_violations"]) < 0
+        ):
+            raise LeaseConflict("database read-only proof is incomplete")
+        return payload, observed_ids
+
+    def complete_database_query_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        execution_id = self._exact_collector_id(
+            str(result.get("execution_id", "")), "database execution"
+        )
+        with self._transaction() as connection:
+            now = self._clock()
+            execution_row = connection.execute(
+                "SELECT * FROM database_query_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            if execution_row is None:
+                raise NotFoundError(
+                    "database query execution %s not found" % execution_id
+                )
+            plan_row = connection.execute(
+                "SELECT * FROM database_query_plans WHERE id = ?",
+                (execution_row["plan_id"],),
+            ).fetchone()
+            if plan_row is None:
+                raise LeaseConflict("database query plan disappeared")
+            plan = self._validated_database_plan_row(connection, plan_row)
+            job, attempt = self._collector_live_binding(
+                connection,
+                job_id=job_id,
+                worker_id=worker_id,
+                lease_token=lease_token,
+                work_item_id=str(plan["work_item_id"]),
+                resource_definition_id=str(plan["resource_definition_id"]),
+                now=now,
+            )
+            if (
+                execution_row["job_id"] != job_id
+                or execution_row["attempt_id"] != attempt["id"]
+            ):
+                raise LeaseConflict(
+                    "database execution belongs to another job or attempt"
+                )
+            result_path = Path(str(execution_row["result_path"]))
+            details, result_sha256, result_bytes = self._collector_artifact(
+                result.get("result_path"),
+                result_path,
+                result.get("result_sha256"),
+                max_bytes=int(plan["max_bytes"]),
+            )
+            payload, observed_ids = self._validated_database_result(
+                result_bytes,
+                int(plan["max_rows"]),
+                int(plan["max_bytes"]),
+                str(plan["id_column"]),
+            )
+            row_count = len(payload["rows"])
+            column_count = len(payload["columns"])
+            row_count_matches = (
+                plan["expected_row_count"] is None
+                or row_count == int(plan["expected_row_count"])
+            )
+            ids_match = observed_ids == list(plan["expected_ids"])
+            foreign_keys_clean = (
+                int(payload["read_only_proof"]["foreign_key_violations"]) == 0
+            )
+            outcome = (
+                "pass"
+                if row_count_matches and ids_match and foreign_keys_clean
+                else "fail"
+            )
+            if execution_row["status"] == "finished":
+                persisted = self._row(execution_row)
+                if (
+                    persisted["row_count"] != row_count
+                    or persisted["column_count"] != column_count
+                    or persisted["observed_ids"] != observed_ids
+                    or persisted["read_only_proof"] != payload["read_only_proof"]
+                    or persisted["result_sha256"] != result_sha256
+                    or persisted["outcome"] != outcome
+                ):
+                    raise LeaseConflict("finished database evidence changed")
+                return persisted
+            if execution_row["status"] != "prepared":
+                raise LeaseConflict("database evidence execution is not completable")
+            artifact_id = _id()
+            connection.execute(
+                """INSERT INTO artifacts
+                   (id, work_item_id, job_id, attempt_id, kind, uri,
+                    metadata_json, created_at)
+                   VALUES (?, ?, ?, ?, 'database_result', ?, ?, ?)""",
+                (
+                    artifact_id,
+                    job["work_item_id"],
+                    job_id,
+                    execution_row["attempt_id"],
+                    str(result_path),
+                    _dump(
+                        {
+                            "attempt_id": execution_row["attempt_id"],
+                            "execution_id": execution_id,
+                            "resource_id": plan["resource_definition_id"],
+                            "query_sha256": plan["query_sha256"],
+                            "sha256": result_sha256,
+                            "bytes": int(details.st_size),
+                            "row_count": row_count,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            connection.execute(
+                """UPDATE database_query_executions
+                   SET status = 'finished', outcome = ?, row_count = ?,
+                       column_count = ?, observed_ids_json = ?,
+                       read_only_proof_json = ?, result_device = ?,
+                       result_inode = ?, result_owner_uid = ?, result_mode = ?,
+                       result_nlink = ?, result_bytes = ?, result_sha256 = ?,
+                       artifact_id = ?, finished_at = ?, updated_at = ?
+                   WHERE id = ? AND status = 'prepared'""",
+                (
+                    outcome,
+                    row_count,
+                    column_count,
+                    _dump(observed_ids),
+                    _dump(payload["read_only_proof"]),
+                    int(details.st_dev),
+                    int(details.st_ino),
+                    int(details.st_uid),
+                    int(details.st_mode),
+                    int(details.st_nlink),
+                    int(details.st_size),
+                    result_sha256,
+                    artifact_id,
+                    now,
+                    now,
+                    execution_id,
+                ),
+            )
+            self._append_event(
+                connection,
+                "artifact.added",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "artifact_id": artifact_id,
+                    "attempt_id": execution_row["attempt_id"],
+                    "kind": "database_result",
+                    "uri": str(result_path),
+                },
+                created_at=now,
+            )
+            self._append_event(
+                connection,
+                "database_evidence.execution_finished",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=worker_id,
+                event_data={
+                    "execution_id": execution_id,
+                    "plan_id": plan["id"],
+                    "attempt_id": execution_row["attempt_id"],
+                    "resource_id": plan["resource_definition_id"],
+                    "query_sha256": plan["query_sha256"],
+                    "outcome": outcome,
+                    "row_count": row_count,
+                    "observed_ids": observed_ids,
+                    "result_sha256": result_sha256,
+                },
+                created_at=now,
+            )
+            finished = connection.execute(
+                "SELECT * FROM database_query_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            return self._row(finished)  # type: ignore[return-value]
+
+    def get_database_query_execution(self, execution_id: str) -> Dict[str, Any]:
+        execution_id = self._exact_collector_id(execution_id, "database execution")
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM database_query_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+        if row is None:
+            raise NotFoundError("database query execution %s not found" % execution_id)
+        return self._row(row)  # type: ignore[return-value]
+
+    def list_database_query_executions(
+        self, *, work_item_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM database_query_executions"
+        parameters: Sequence[Any] = ()
+        if work_item_id is not None:
+            sql += " WHERE work_item_id = ?"
+            parameters = (work_item_id,)
+        sql += " ORDER BY work_item_id, prepared_at, id"
+        with self._lock:
+            rows = self._connection.execute(sql, parameters).fetchall()
+        return self._rows(rows)
 
     def read_campaign_status_snapshot(
         self, campaign_id: str, *, event_limit: int = 8
@@ -657,7 +2688,17 @@ class SQLiteStore:
                            FROM attempts a
                            JOIN jobs attempt_job ON attempt_job.id = a.job_id
                            LEFT JOIN external_processes ep
-                             ON ep.attempt_id = a.id
+                             ON ep.id = (
+                                 SELECT latest_process.id
+                                 FROM external_processes latest_process
+                                 WHERE latest_process.attempt_id = a.id
+                                 ORDER BY
+                                     CASE WHEN latest_process.state IN (
+                                         'quarantined', 'legacy_unverifiable')
+                                         THEN 0 ELSE 1 END,
+                                     latest_process.recorded_at DESC,
+                                     latest_process.id DESC
+                                 LIMIT 1)
                            WHERE (a.job_id IN (%s)
                                   AND a.attempt_number = (
                                       SELECT MAX(a2.attempt_number)
@@ -691,11 +2732,14 @@ class SQLiteStore:
                     attempts = self._rows(attempt_rows)
                     lease_rows = self._connection.execute(
                         """SELECT r.* FROM resource_leases r
-                           WHERE r.job_id IN (%s) ORDER BY r.resource_key"""
+                           WHERE r.job_id IN (%s)
+                           ORDER BY r.resource_key, r.lease_slot"""
                         % job_placeholders,
                         job_ids,
                     ).fetchall()
-                    resource_leases = self._rows(lease_rows)
+                    resource_leases = self._safe_resource_lease_records(
+                        self._connection, lease_rows
+                    )
 
                 worktree_rows = self._connection.execute(
                     """SELECT w.* FROM managed_worktrees w
@@ -2469,6 +4513,207 @@ class SQLiteStore:
                 ).fetchone()
             )  # type: ignore[return-value]
 
+    def _resource_claim_plan(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        resources: Sequence[str],
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Resolve exact lease slots or fail closed without mutating state."""
+
+        plan: List[Dict[str, Any]] = []
+        for value in resources:
+            resource_key = str(value)
+            definition: Optional[Dict[str, Any]] = None
+            concurrency_limit = 1
+            stripped_resource_key = resource_key.strip()
+            if (
+                stripped_resource_key.startswith(RESOURCE_DEFINITION_PREFIX)
+                and stripped_resource_key != resource_key
+            ):
+                return None
+            if resource_key.startswith(RESOURCE_DEFINITION_PREFIX):
+                if RESOURCE_DEFINITION_ID_PATTERN.fullmatch(resource_key) is None:
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM resource_definitions WHERE id = ?",
+                    (resource_key,),
+                ).fetchone()
+                if row is None or not bool(row["enabled"]):
+                    return None
+                try:
+                    definition = self._validated_resource_definition_row(row)
+                except StorageError:
+                    return None
+                if definition["campaign_id"] not in (None, job["campaign_id"]):
+                    return None
+                concurrency_limit = int(definition["policy"]["limit"])
+            held_slots = {
+                int(row["lease_slot"])
+                for row in connection.execute(
+                    """SELECT lease_slot FROM resource_leases
+                       WHERE resource_key = ?""",
+                    (resource_key,),
+                ).fetchall()
+            }
+            lease_slot = next(
+                (
+                    slot
+                    for slot in range(1, concurrency_limit + 1)
+                    if slot not in held_slots
+                ),
+                None,
+            )
+            if lease_slot is None:
+                return None
+            plan.append(
+                {
+                    "resource_key": resource_key,
+                    "lease_slot": lease_slot,
+                    "resource_definition_id": (
+                        None if definition is None else definition["id"]
+                    ),
+                    "definition": definition,
+                }
+            )
+        return plan
+
+    def _registered_job_resource_leases(
+        self, connection: sqlite3.Connection, job_id: str
+    ) -> List[sqlite3.Row]:
+        return connection.execute(
+            """SELECT r.* FROM resource_leases r
+               WHERE r.job_id = ?
+                 AND r.resource_definition_id IS NOT NULL
+               ORDER BY r.resource_key, r.lease_slot""",
+            (job_id,),
+        ).fetchall()
+
+    def _assert_registered_resource_fences(
+        self,
+        connection: sqlite3.Connection,
+        job: Mapping[str, Any],
+        now: float,
+    ) -> None:
+        rows = self._registered_job_resource_leases(
+            connection, str(job["id"])
+        )
+        for lease in rows:
+            definition_row = connection.execute(
+                "SELECT * FROM resource_definitions WHERE id = ?",
+                (lease["resource_definition_id"],),
+            ).fetchone()
+            if definition_row is None:
+                raise LeaseConflict("registered resource definition disappeared")
+            try:
+                definition = self._validated_resource_definition_row(
+                    definition_row
+                )
+            except StorageError as error:
+                raise LeaseConflict(
+                    "registered resource definition integrity changed"
+                ) from error
+            if (
+                not bool(definition["enabled"])
+                or definition["campaign_id"] not in (None, job["campaign_id"])
+                or lease["resource_key"] != definition["id"]
+                or lease["resource_identity_hash"] != definition["identity_hash"]
+                or int(lease["lease_slot"]) > int(definition["policy"]["limit"])
+                or lease["expires_at"] <= now
+            ):
+                raise LeaseConflict(
+                    "registered resource definition or lease identity changed"
+                )
+
+    def _safe_resource_lease_records(
+        self,
+        connection: sqlite3.Connection,
+        rows: Sequence[sqlite3.Row],
+    ) -> List[Dict[str, Any]]:
+        records = self._rows(rows)
+        definitions: Dict[str, Optional[Dict[str, Any]]] = {}
+        for record in records:
+            definition_id = record.get("resource_definition_id")
+            if definition_id is None:
+                continue
+            exact_id = str(definition_id)
+            if exact_id not in definitions:
+                definition_row = connection.execute(
+                    "SELECT * FROM resource_definitions WHERE id = ?",
+                    (exact_id,),
+                ).fetchone()
+                if definition_row is None:
+                    definitions[exact_id] = None
+                else:
+                    try:
+                        definitions[exact_id] = (
+                            self._validated_resource_definition_row(
+                                definition_row
+                            )
+                        )
+                    except StorageError:
+                        definitions[exact_id] = None
+            definition = definitions[exact_id]
+            record["resource_kind"] = (
+                None if definition is None else definition["kind"]
+            )
+            record["resource_label"] = (
+                None if definition is None else definition["label"]
+            )
+        return records
+
+    def _append_resource_lease_events(
+        self,
+        connection: sqlite3.Connection,
+        event_kind: str,
+        leases: Sequence[Mapping[str, Any]],
+        *,
+        campaign_id: str,
+        work_item_id: str,
+        job_id: str,
+        actor: Optional[str],
+        created_at: float,
+    ) -> None:
+        for lease in leases:
+            if lease["resource_definition_id"] is None:
+                continue
+            definition_row = connection.execute(
+                "SELECT * FROM resource_definitions WHERE id = ?",
+                (lease["resource_definition_id"],),
+            ).fetchone()
+            definition: Optional[Dict[str, Any]] = None
+            if definition_row is not None:
+                try:
+                    definition = self._validated_resource_definition_row(
+                        definition_row
+                    )
+                except StorageError:
+                    definition = None
+            event_data: Dict[str, Any] = {
+                "resource_id": lease["resource_definition_id"],
+                "lease_slot": lease["lease_slot"],
+            }
+            if definition is None:
+                event_data["definition_status"] = "invalid"
+            else:
+                event_data.update(
+                    {
+                        "kind": definition["kind"],
+                        "label": definition["label"],
+                        "policy": definition["policy"],
+                    }
+                )
+            self._append_event(
+                connection,
+                event_kind,
+                campaign_id=campaign_id,
+                work_item_id=work_item_id,
+                job_id=job_id,
+                actor=actor,
+                event_data=event_data,
+                created_at=created_at,
+            )
+
     def claim_job(
         self, role: str, worker_id: str, *, lease_seconds: float = 60.0
     ) -> Optional[Dict[str, Any]]:
@@ -2561,15 +4806,11 @@ class SQLiteStore:
                 if active_total >= job["global_limit"] or active_by_role.get(role, 0) >= role_limit:
                     continue
                 resources = _load(job["required_resources_json"], [])
-                if resources:
-                    placeholders = ",".join("?" for _ in resources)
-                    held = connection.execute(
-                        "SELECT 1 FROM resource_leases WHERE resource_key IN (%s) LIMIT 1"
-                        % placeholders,
-                        resources,
-                    ).fetchone()
-                    if held is not None:
-                        continue
+                resource_plan = self._resource_claim_plan(
+                    connection, job, resources
+                )
+                if resource_plan is None:
+                    continue
                 changed = connection.execute(
                     "UPDATE work_items SET state = ?, updated_at = ? WHERE id = ? AND state = ?",
                     (job["active_item_state"], now, job["work_item_id"], job["queued_item_state"]),
@@ -2611,12 +4852,29 @@ class SQLiteStore:
                         expires_at,
                     ),
                 )
-                for resource in resources:
+                for resource in resource_plan:
                     connection.execute(
                         """INSERT INTO resource_leases
-                           (resource_key, owner_id, job_id, lease_token, acquired_at,
-                            heartbeat_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (resource, worker_id, job["id"], token, now, now, expires_at),
+                           (resource_key, lease_slot, resource_definition_id,
+                            resource_identity_hash, owner_id, job_id,
+                            lease_token, acquired_at, heartbeat_at, expires_at)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            resource["resource_key"],
+                            resource["lease_slot"],
+                            resource["resource_definition_id"],
+                            (
+                                None
+                                if resource["definition"] is None
+                                else resource["definition"]["identity_hash"]
+                            ),
+                            worker_id,
+                            job["id"],
+                            token,
+                            now,
+                            now,
+                            expires_at,
+                        ),
                     )
                 self._append_event(
                     connection, "job.claimed", campaign_id=job["campaign_id"],
@@ -2626,29 +4884,105 @@ class SQLiteStore:
                                 "from_state": job["queued_item_state"],
                                 "to_state": job["active_item_state"]}, created_at=now
                 )
+                registered_leases = self._registered_job_resource_leases(
+                    connection, str(job["id"])
+                )
+                self._append_resource_lease_events(
+                    connection,
+                    "resource.claimed",
+                    registered_leases,
+                    campaign_id=str(job["campaign_id"]),
+                    work_item_id=str(job["work_item_id"]),
+                    job_id=str(job["id"]),
+                    actor=worker_id,
+                    created_at=now,
+                )
                 claimed = connection.execute(
                     "SELECT * FROM jobs WHERE id = ?", (job["id"],)
                 ).fetchone()
                 result = self._row(claimed)
                 result.update({"attempt_id": attempt_id, "attempt_number": attempt_number})
-                resumable = connection.execute(
-                    """SELECT external_provider, external_session_id
-                       FROM attempts
-                       WHERE job_id = ? AND attempt_number < ?
-                         AND status = 'interrupted'
-                         AND external_provider IS NOT NULL
-                         AND external_session_id IS NOT NULL
-                       ORDER BY attempt_number DESC LIMIT 1""",
-                    (job["id"], attempt_number),
+                resume_request = connection.execute(
+                    """SELECT * FROM operator_controls
+                       WHERE job_id = ? AND action = 'resume' AND status = 'pending'
+                       ORDER BY requested_at, id LIMIT 1""",
+                    (job["id"],),
                 ).fetchone()
-                if resumable is not None:
+                if resume_request is not None:
+                    source = connection.execute(
+                        """SELECT * FROM attempts
+                           WHERE id = ? AND job_id = ? AND status = 'interrupted'""",
+                        (resume_request["source_attempt_id"], job["id"]),
+                    ).fetchone()
+                    resources_json, resources_hash = self._operator_resource_snapshot(job)
+                    unresolved = connection.execute(
+                        """SELECT 1 FROM external_processes
+                           WHERE attempt_id = ? AND state != 'stopped' LIMIT 1""",
+                        (resume_request["source_attempt_id"],),
+                    ).fetchone()
+                    stopped_provider_process = connection.execute(
+                        """SELECT 1 FROM external_processes
+                           WHERE attempt_id = ? AND state = 'stopped'
+                             AND provider = ? LIMIT 1""",
+                        (
+                            resume_request["source_attempt_id"],
+                            resume_request["expected_provider"],
+                        ),
+                    ).fetchone()
+                    if (
+                        source is None
+                        or source["attempt_number"] != attempt_number - 1
+                        or source["external_provider"]
+                        != resume_request["expected_provider"]
+                        or source["external_session_id"]
+                        != resume_request["expected_session_id"]
+                        or source["managed_worktree_id"]
+                        != resume_request["expected_worktree_id"]
+                        or source["managed_worktree_generation"]
+                        != resume_request["expected_worktree_generation"]
+                        or resume_request["expected_resources_json"]
+                        != resources_json
+                        or resume_request["expected_resources_sha256"]
+                        != resources_hash
+                        or unresolved is not None
+                        or stopped_provider_process is None
+                    ):
+                        raise LeaseConflict(
+                            "operator resume authorization changed before claim"
+                        )
+                    changed = connection.execute(
+                        """UPDATE operator_controls
+                           SET status = 'applied', target_attempt_id = ?, applied_at = ?
+                           WHERE id = ? AND status = 'pending'""",
+                        (attempt_id, now, resume_request["id"]),
+                    ).rowcount
+                    if changed != 1:
+                        raise LeaseConflict(
+                            "operator resume authorization was consumed concurrently"
+                        )
+                    self._append_event(
+                        connection,
+                        "operator.resume_applied",
+                        campaign_id=job["campaign_id"],
+                        work_item_id=job["work_item_id"],
+                        job_id=job["id"],
+                        actor=resume_request["requested_by"],
+                        event_data={
+                            "request_id": resume_request["id"],
+                            "source_attempt_id": source["id"],
+                            "target_attempt_id": attempt_id,
+                            "provider": resume_request["expected_provider"],
+                            "session_id": resume_request["expected_session_id"],
+                        },
+                        created_at=now,
+                    )
                     result.update(
                         {
-                            "resume_external_provider": resumable[
-                                "external_provider"
+                            "resume_external_provider": resume_request[
+                                "expected_provider"
                             ],
-                            "resume_external_session_id": resumable[
-                                "external_session_id"
+                            "resume_external_session_id": resume_request[
+                                "expected_session_id"
                             ],
                         }
                     )
@@ -2676,6 +5010,7 @@ class SQLiteStore:
             now = self._clock()
             expires_at = now + lease_seconds
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            self._assert_registered_resource_fences(connection, job, now)
             connection.execute(
                 """UPDATE jobs
                    SET heartbeat_at = ?, lease_expires_at = ?, updated_at = ?
@@ -2696,6 +5031,407 @@ class SQLiteStore:
             if updated != len(expected_resources):
                 raise LeaseConflict("one or more required resource leases were lost")
         return self.get_job(job_id)
+
+    @staticmethod
+    def _operator_resource_snapshot(job: Mapping[str, Any]) -> tuple[str, str]:
+        resources = _load(job["required_resources_json"], [])
+        raw = _dump(resources)
+        return raw, hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+    def request_job_interrupt(
+        self,
+        job_id: str,
+        lease_token: str,
+        *,
+        requested_by: str,
+        reason: str,
+    ) -> Dict[str, Any]:
+        """Durably request cancellation of one exact live job/process fence."""
+
+        requested_by = _operator_text(requested_by, "identity", 256)
+        reason = _operator_text(reason, "interrupt reason", 4096)
+        if (
+            not isinstance(job_id, str)
+            or job_id != job_id.strip()
+            or not job_id
+            or not isinstance(lease_token, str)
+            or lease_token != lease_token.strip()
+            or not lease_token
+        ):
+            raise ValueError("operator interrupt requires exact job and lease IDs")
+        with self._transaction() as connection:
+            now = self._clock()
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise NotFoundError("job %s not found" % job_id)
+            if (
+                job["status"] != "running"
+                or job["lease_token"] != lease_token
+                or job["lease_expires_at"] <= now
+                or not job["lease_owner"]
+                or not job["current_attempt_id"]
+            ):
+                raise LeaseConflict("operator interrupt fence is absent or stale")
+            existing = connection.execute(
+                """SELECT * FROM operator_controls
+                   WHERE job_id = ? AND action = 'interrupt' AND status = 'pending'""",
+                (job_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["source_attempt_id"] == job["current_attempt_id"]
+                    and existing["expected_lease_token"] == lease_token
+                    and existing["requested_by"] == requested_by
+                    and existing["reason"] == reason
+                ):
+                    return self._row(existing)  # type: ignore[return-value]
+                raise LeaseConflict(
+                    "another operator interrupt is already pending for this job"
+                )
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ? AND status = 'running'",
+                (job["current_attempt_id"],),
+            ).fetchone()
+            if attempt is None:
+                raise LeaseConflict("operator interrupt attempt is absent or stale")
+            external = connection.execute(
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND state != 'stopped'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (attempt["id"],),
+            ).fetchone()
+            resources_json, resources_hash = self._operator_resource_snapshot(job)
+            request_id = _id()
+            connection.execute(
+                """INSERT INTO operator_controls
+                   (id, job_id, source_attempt_id, action, status, requested_by,
+                    reason, expected_lease_owner, expected_lease_token,
+                    expected_provider, expected_session_id,
+                    expected_process_id, expected_process_group_id,
+                    expected_process_start_seconds,
+                    expected_process_start_microseconds,
+                    expected_process_executable, expected_worktree_id,
+                    expected_worktree_generation, expected_resources_json,
+                    expected_resources_sha256, requested_at)
+                   VALUES (?, ?, ?, 'interrupt', 'pending', ?, ?, ?, ?, ?, ?,
+                           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    request_id,
+                    job_id,
+                    attempt["id"],
+                    requested_by,
+                    reason,
+                    job["lease_owner"],
+                    lease_token,
+                    attempt["external_provider"],
+                    attempt["external_session_id"],
+                    None if external is None else external["process_id"],
+                    None if external is None else external["process_group_id"],
+                    None if external is None else external["start_seconds"],
+                    None if external is None else external["start_microseconds"],
+                    None if external is None else external["kernel_executable"],
+                    attempt["managed_worktree_id"],
+                    attempt["managed_worktree_generation"],
+                    resources_json,
+                    resources_hash,
+                    now,
+                ),
+            )
+            self._append_event(
+                connection,
+                "operator.interrupt_requested",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=requested_by,
+                event_data={
+                    "request_id": request_id,
+                    "attempt_id": attempt["id"],
+                    "process_id": None if external is None else external["process_id"],
+                    "process_group_id": (
+                        None if external is None else external["process_group_id"]
+                    ),
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM operator_controls WHERE id = ?", (request_id,)
+            ).fetchone()
+            return self._row(row)  # type: ignore[return-value]
+
+    def _assert_operator_interrupt_request(
+        self,
+        connection: sqlite3.Connection,
+        request_id: str,
+        job: sqlite3.Row,
+        worker_id: str,
+        lease_token: str,
+        *,
+        allow_stopped_process: bool = False,
+    ) -> sqlite3.Row:
+        request = connection.execute(
+            """SELECT * FROM operator_controls
+               WHERE id = ? AND action = 'interrupt' AND status = 'pending'""",
+            (request_id,),
+        ).fetchone()
+        if request is None:
+            raise LeaseConflict("operator interrupt request is absent or stale")
+        resources_json, resources_hash = self._operator_resource_snapshot(job)
+        if (
+            request["job_id"] != job["id"]
+            or request["source_attempt_id"] != job["current_attempt_id"]
+            or request["expected_lease_owner"] != worker_id
+            or request["expected_lease_token"] != lease_token
+            or request["expected_worktree_id"] != job["managed_worktree_id"]
+            or request["expected_resources_json"] != resources_json
+            or request["expected_resources_sha256"] != resources_hash
+        ):
+            raise LeaseConflict("operator interrupt request no longer matches its job fence")
+        attempt = connection.execute(
+            "SELECT * FROM attempts WHERE id = ? AND status = 'running'",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["managed_worktree_id"] != request["expected_worktree_id"]
+            or attempt["managed_worktree_generation"]
+            != request["expected_worktree_generation"]
+            or attempt["external_provider"] != request["expected_provider"]
+            or attempt["external_session_id"] != request["expected_session_id"]
+        ):
+            raise LeaseConflict("operator interrupt attempt identity changed")
+        if allow_stopped_process and request["expected_process_id"] is not None:
+            external = connection.execute(
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND process_id = ?
+                     AND process_group_id = ?
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (
+                    attempt["id"],
+                    request["expected_process_id"],
+                    request["expected_process_group_id"],
+                ),
+            ).fetchone()
+            if external is None or external["state"] not in ("active", "stopped"):
+                raise LeaseConflict(
+                    "operator interrupt process identity is unresolved"
+                )
+            if external["state"] == "stopped":
+                replacement = connection.execute(
+                    """SELECT 1 FROM external_processes
+                       WHERE attempt_id = ? AND state != 'stopped'
+                         AND id != ? LIMIT 1""",
+                    (attempt["id"], external["id"]),
+                ).fetchone()
+                if replacement is not None:
+                    raise LeaseConflict(
+                        "operator interrupt cannot cross into a replacement process"
+                    )
+        else:
+            external = connection.execute(
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND state != 'stopped'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (attempt["id"],),
+            ).fetchone()
+        expected_process = (
+            request["expected_process_id"],
+            request["expected_process_group_id"],
+            request["expected_process_start_seconds"],
+            request["expected_process_start_microseconds"],
+            request["expected_process_executable"],
+        )
+        observed_process = (
+            None,
+            None,
+            None,
+            None,
+            None,
+        ) if external is None else (
+            external["process_id"],
+            external["process_group_id"],
+            external["start_seconds"],
+            external["start_microseconds"],
+            external["kernel_executable"],
+        )
+        if expected_process != observed_process:
+            raise LeaseConflict("operator interrupt process identity changed")
+        return request
+
+    def poll_operator_interrupt(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return only a pending request matching the exact current fence."""
+
+        with self._lock:
+            now = self._clock()
+            job = self._assert_live_lease(
+                self._connection, job_id, worker_id, lease_token, now
+            )
+            request = self._connection.execute(
+                """SELECT id FROM operator_controls
+                   WHERE job_id = ? AND action = 'interrupt' AND status = 'pending'""",
+                (job_id,),
+            ).fetchone()
+            if request is None:
+                return None
+            validated = self._assert_operator_interrupt_request(
+                self._connection,
+                str(request["id"]),
+                job,
+                worker_id,
+                lease_token,
+                allow_stopped_process=True,
+            )
+            return self._row(validated)
+
+    @staticmethod
+    def _assert_no_pending_operator_interrupt(
+        connection: sqlite3.Connection, job_id: str
+    ) -> None:
+        pending = connection.execute(
+            """SELECT 1 FROM operator_controls
+               WHERE job_id = ? AND action = 'interrupt'
+                 AND status = 'pending' LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+        if pending is not None:
+            raise LeaseConflict(
+                "pending operator interrupt must be resolved before this mutation"
+            )
+
+    def request_job_resume(
+        self,
+        job_id: str,
+        source_attempt_id: str,
+        provider: str,
+        session_id: str,
+        *,
+        requested_by: str,
+        reason: str = "resume exact persisted external session",
+    ) -> Dict[str, Any]:
+        """Authorize one exact interrupted session for the next claim only."""
+
+        requested_by = _operator_text(requested_by, "identity", 256)
+        reason = _operator_text(reason, "resume reason", 4096)
+        for name, value, limit in (
+            ("job id", job_id, 512),
+            ("source attempt id", source_attempt_id, 512),
+            ("provider", provider, 64),
+            ("session id", session_id, 512),
+        ):
+            if (
+                not isinstance(value, str)
+                or value != value.strip()
+                or not value
+                or len(value) > limit
+            ):
+                raise ValueError("operator resume %s must be byte-exact" % name)
+        with self._transaction() as connection:
+            now = self._clock()
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if (
+                job is None
+                or job["status"] != "pending"
+                or job["current_attempt_id"] is not None
+            ):
+                raise LeaseConflict("operator resume requires one pending logical job")
+            attempt = connection.execute(
+                """SELECT * FROM attempts
+                   WHERE id = ? AND job_id = ? AND status = 'interrupted'""",
+                (source_attempt_id, job_id),
+            ).fetchone()
+            if (
+                attempt is None
+                or attempt["attempt_number"] != job["attempt_count"]
+                or attempt["external_provider"] != provider
+                or attempt["external_session_id"] != session_id
+            ):
+                raise LeaseConflict("operator resume session identity is stale or mismatched")
+            unresolved = connection.execute(
+                """SELECT 1 FROM external_processes
+                   WHERE attempt_id = ? AND state != 'stopped' LIMIT 1""",
+                (source_attempt_id,),
+            ).fetchone()
+            if unresolved is not None:
+                raise LeaseConflict("operator resume source process is not durably stopped")
+            stopped_provider_process = connection.execute(
+                """SELECT 1 FROM external_processes
+                   WHERE attempt_id = ? AND state = 'stopped'
+                     AND provider = ? LIMIT 1""",
+                (source_attempt_id, provider),
+            ).fetchone()
+            if stopped_provider_process is None:
+                raise LeaseConflict(
+                    "operator resume source lacks exact stopped provider process proof"
+                )
+            resources_json, resources_hash = self._operator_resource_snapshot(job)
+            request_id = _id()
+            try:
+                connection.execute(
+                    """INSERT INTO operator_controls
+                       (id, job_id, source_attempt_id, action, status,
+                        requested_by, reason, expected_provider,
+                        expected_session_id, expected_worktree_id,
+                        expected_worktree_generation, expected_resources_json,
+                        expected_resources_sha256, requested_at)
+                       VALUES (?, ?, ?, 'resume', 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        request_id,
+                        job_id,
+                        source_attempt_id,
+                        requested_by,
+                        reason,
+                        provider,
+                        session_id,
+                        attempt["managed_worktree_id"],
+                        attempt["managed_worktree_generation"],
+                        resources_json,
+                        resources_hash,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise LeaseConflict(
+                    "another operator resume is already pending for this job"
+                ) from error
+            self._append_event(
+                connection,
+                "operator.resume_requested",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job_id,
+                actor=requested_by,
+                event_data={
+                    "request_id": request_id,
+                    "source_attempt_id": source_attempt_id,
+                    "provider": provider,
+                    "session_id": session_id,
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+            row = connection.execute(
+                "SELECT * FROM operator_controls WHERE id = ?", (request_id,)
+            ).fetchone()
+            return self._row(row)  # type: ignore[return-value]
+
+    def list_operator_controls(
+        self, *, job_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        sql = "SELECT * FROM operator_controls"
+        parameters: Sequence[Any] = ()
+        if job_id is not None:
+            sql += " WHERE job_id = ?"
+            parameters = (job_id,)
+        sql += " ORDER BY requested_at, id"
+        with self._lock:
+            return self._rows(self._connection.execute(sql, parameters).fetchall())
 
     def record_external_session(
         self,
@@ -2725,6 +5461,50 @@ class SQLiteStore:
             ).fetchone()
             if attempt is None or attempt["status"] != "running":
                 raise LeaseConflict("current running attempt is absent")
+
+            resume_authorization = connection.execute(
+                """SELECT source_attempt_id, expected_provider,
+                          expected_session_id
+                   FROM operator_controls
+                   WHERE target_attempt_id = ? AND action = 'resume'
+                     AND status = 'applied'""",
+                (attempt["id"],),
+            ).fetchone()
+            if resume_authorization is not None and (
+                resume_authorization["expected_provider"] != provider
+                or resume_authorization["expected_session_id"] != session_id
+            ):
+                raise LeaseConflict(
+                    "external session does not match the exact resume authorization"
+                )
+
+            prior_same_job = connection.execute(
+                """SELECT 1 FROM attempts
+                   WHERE external_provider = ? AND external_session_id = ?
+                     AND job_id = ? AND id != ? LIMIT 1""",
+                (provider, session_id, job_id, attempt["id"]),
+            ).fetchone()
+            if prior_same_job is not None:
+                if resume_authorization is None:
+                    raise LeaseConflict(
+                        "reusing an external session requires exact operator resume authorization"
+                    )
+                authorized_source = connection.execute(
+                    """SELECT 1 FROM attempts
+                       WHERE id = ? AND job_id = ?
+                         AND external_provider = ? AND external_session_id = ?
+                       LIMIT 1""",
+                    (
+                        resume_authorization["source_attempt_id"],
+                        job_id,
+                        provider,
+                        session_id,
+                    ),
+                ).fetchone()
+                if authorized_source is None:
+                    raise LeaseConflict(
+                        "external session reuse does not match its authorized source"
+                    )
 
             existing = (
                 attempt["external_provider"],
@@ -2850,7 +5630,9 @@ class SQLiteStore:
             if attempt is None or attempt["status"] != "running":
                 raise LeaseConflict("current running attempt is absent")
             external = connection.execute(
-                "SELECT * FROM external_processes WHERE attempt_id = ?",
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND state != 'stopped'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
                 (job["current_attempt_id"],),
             ).fetchone()
             requested = (
@@ -2914,8 +5696,7 @@ class SQLiteStore:
                    SET external_process_id = ?, external_process_group_id = ?,
                        external_process_executable = ?,
                        external_process_started_at = ?
-                   WHERE id = ? AND status = 'running'
-                     AND external_process_id IS NULL""",
+                   WHERE id = ? AND status = 'running'""",
                 (
                     process_id,
                     process_group_id,
@@ -2966,6 +5747,22 @@ class SQLiteStore:
             job = self._assert_live_lease(
                 connection, job_id, worker_id, lease_token, now
             )
+            matching_identities = int(
+                connection.execute(
+                    """SELECT COUNT(*) FROM external_processes
+                       WHERE attempt_id = ? AND process_id = ?
+                         AND process_group_id = ?""",
+                    (
+                        job["current_attempt_id"],
+                        process_id,
+                        process_group_id,
+                    ),
+                ).fetchone()[0]
+            )
+            if matching_identities != 1:
+                raise LeaseConflict(
+                    "external process PID reuse is ambiguous without exact birth identity"
+                )
             changed = connection.execute(
                 """UPDATE external_processes
                    SET state = 'stopped', stopped_at = ?, outcome = 'reaped',
@@ -2996,8 +5793,11 @@ class SQLiteStore:
                 created_at=now,
             )
             recorded = connection.execute(
-                "SELECT * FROM external_processes WHERE attempt_id = ?",
-                (job["current_attempt_id"],),
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND process_id = ?
+                     AND process_group_id = ? AND state = 'stopped'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (job["current_attempt_id"], process_id, process_group_id),
             ).fetchone()
             return self._row(recorded)  # type: ignore[return-value]
 
@@ -3007,7 +5807,8 @@ class SQLiteStore:
     ) -> None:
         external = connection.execute(
             """SELECT state FROM external_processes
-               WHERE attempt_id = ?""",
+               WHERE attempt_id = ? AND state != 'stopped'
+               ORDER BY recorded_at DESC, id DESC LIMIT 1""",
             (job["current_attempt_id"],),
         ).fetchone()
         attempt = connection.execute(
@@ -3017,7 +5818,14 @@ class SQLiteStore:
         if attempt is None:
             raise LeaseConflict("current attempt is absent")
         if external is None and attempt["external_process_id"] is not None:
-            raise LeaseConflict("external process identity record is missing")
+            latest = connection.execute(
+                """SELECT state FROM external_processes
+                   WHERE attempt_id = ? AND process_id = ?
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (job["current_attempt_id"], attempt["external_process_id"]),
+            ).fetchone()
+            if latest is None:
+                raise LeaseConflict("external process identity record is missing")
         if external is not None and external["state"] != "stopped":
             raise LeaseConflict(
                 "external process must be reaped before the attempt can finish"
@@ -3332,9 +6140,14 @@ class SQLiteStore:
                 raise TransitionConflict(
                     "focused test plans can be created only for ready-for-test items"
                 )
-            if _load(item["required_gates_json"], []) != ["focused_tests"]:
+            required_gates = _load(item["required_gates_json"], [])
+            if required_gates not in (
+                ["focused_tests"],
+                list(DEFAULT_REQUIRED_GATES),
+            ):
                 raise ValueError(
-                    "the focused collector slice supports exactly the focused_tests gate"
+                    "the focused collector supports only its gate or the fixed "
+                    "focused/browser/database pipeline"
                 )
             if _load(item["config_json"], {}).get("allow_simulated_evidence") is True:
                 raise ValueError("authoritative focused plans cannot be simulated")
@@ -3481,9 +6294,14 @@ class SQLiteStore:
                 ).fetchone()
                 if item is None:
                     raise NotFoundError("work item %s not found" % job["work_item_id"])
-                if _load(item["required_gates_json"], []) != ["focused_tests"]:
+                required_gates = _load(item["required_gates_json"], [])
+                if required_gates not in (
+                    ["focused_tests"],
+                    list(DEFAULT_REQUIRED_GATES),
+                ):
                     raise ValueError(
-                        "the focused collector slice supports exactly the focused_tests gate"
+                        "the focused collector supports only its gate or the fixed "
+                        "focused/browser/database pipeline"
                     )
                 plan = connection.execute(
                     """SELECT * FROM focused_test_plans WHERE work_item_id = ?
@@ -3860,7 +6678,9 @@ class SQLiteStore:
         ):
             raise LeaseConflict("focused execution worktree generation changed")
         external = connection.execute(
-            "SELECT * FROM external_processes WHERE attempt_id = ?",
+            """SELECT * FROM external_processes
+               WHERE attempt_id = ? AND provider = 'focused_test'
+               ORDER BY recorded_at DESC, id DESC LIMIT 1""",
             (job["current_attempt_id"],),
         ).fetchone()
         if (
@@ -4002,7 +6822,9 @@ class SQLiteStore:
                 raise ValueError("focused exit_code must be an integer")
             self._assert_external_process_stopped(connection, job)
             external = connection.execute(
-                "SELECT * FROM external_processes WHERE attempt_id = ?",
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND provider = 'focused_test'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
                 (job["current_attempt_id"],),
             ).fetchone()
             if (
@@ -4224,7 +7046,9 @@ class SQLiteStore:
         lease_token: str, result: Mapping[str, Any], now: float
     ) -> None:
         self._assert_external_process_stopped(connection, job)
+        self._assert_resume_authorization_fulfilled(connection, job)
         self._assert_managed_worktree_binding(connection, job)
+        self._assert_registered_resource_fences(connection, job, now)
         expected_resources = set(_load(job["required_resources_json"], []))
         persisted_resources = connection.execute(
             """SELECT resource_key, owner_id, lease_token, expires_at
@@ -4241,6 +7065,9 @@ class SQLiteStore:
         )
         if actual_resources != expected_resources or not fences_match:
             raise LeaseConflict("one or more required resource lease fences were lost")
+        registered_leases = self._registered_job_resource_leases(
+            connection, str(job["id"])
+        )
 
         attempt_changed = connection.execute(
             """UPDATE attempts SET status = 'succeeded', result_json = ?, finished_at = ?
@@ -4263,6 +7090,330 @@ class SQLiteStore:
         ).rowcount
         if released != len(expected_resources):
             raise LeaseConflict("required resources changed during finalization")
+        self._append_resource_lease_events(
+            connection,
+            "resource.released",
+            registered_leases,
+            campaign_id=str(job["campaign_id"]),
+            work_item_id=str(job["work_item_id"]),
+            job_id=str(job["id"]),
+            actor=worker_id,
+            created_at=now,
+        )
+
+    @staticmethod
+    def _assert_resume_authorization_fulfilled(
+        connection: sqlite3.Connection, job: sqlite3.Row
+    ) -> None:
+        authorization = connection.execute(
+            """SELECT expected_provider, expected_session_id
+               FROM operator_controls
+               WHERE target_attempt_id = ? AND action = 'resume'
+                 AND status = 'applied'""",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if authorization is None:
+            return
+        attempt = connection.execute(
+            "SELECT external_provider, external_session_id FROM attempts WHERE id = ?",
+            (job["current_attempt_id"],),
+        ).fetchone()
+        if (
+            attempt is None
+            or attempt["external_provider"] != authorization["expected_provider"]
+            or attempt["external_session_id"]
+            != authorization["expected_session_id"]
+        ):
+            raise LeaseConflict(
+                "resumed attempt did not bind its exact authorized session"
+            )
+        stopped_process = connection.execute(
+            """SELECT 1 FROM external_processes
+               WHERE attempt_id = ? AND state = 'stopped' AND provider = ?
+               LIMIT 1""",
+            (job["current_attempt_id"], authorization["expected_provider"]),
+        ).fetchone()
+        if stopped_process is None:
+            raise LeaseConflict(
+                "resumed attempt lacks exact stopped provider process proof"
+            )
+
+    def _assert_finished_browser_execution(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        execution = connection.execute(
+            """SELECT * FROM browser_evidence_executions
+               WHERE attempt_id = ? AND job_id = ?""",
+            (job["current_attempt_id"], job["id"]),
+        ).fetchone()
+        if (
+            execution is None
+            or execution["status"] != "finished"
+            or execution["work_item_id"] != job["work_item_id"]
+        ):
+            raise LeaseConflict(
+                "current tester attempt has no finished browser evidence"
+            )
+        self._assert_stopped_collector_process(
+            connection, str(job["current_attempt_id"]), "browser_evidence"
+        )
+        plan_row = connection.execute(
+            "SELECT * FROM browser_evidence_plans WHERE id = ?",
+            (execution["plan_id"],),
+        ).fetchone()
+        if plan_row is None:
+            raise LeaseConflict("browser evidence plan disappeared")
+        plan = self._validated_browser_plan_row(connection, plan_row)
+        if (
+            execution["resource_definition_id"]
+            != plan["resource_definition_id"]
+            or execution["resource_identity_hash"]
+            != plan["resource_identity_hash"]
+            or execution["requested_route"] != plan["route"]
+        ):
+            raise LeaseConflict("browser execution authority changed")
+        details, digest, _raw = self._collector_artifact(
+            execution["screenshot_path"],
+            Path(str(execution["screenshot_path"])),
+            execution["screenshot_sha256"],
+            max_bytes=16 * 1024 * 1024,
+        )
+        for column, observed in (
+            ("screenshot_device", details.st_dev),
+            ("screenshot_inode", details.st_ino),
+            ("screenshot_owner_uid", details.st_uid),
+            ("screenshot_mode", details.st_mode),
+            ("screenshot_nlink", details.st_nlink),
+            ("screenshot_bytes", details.st_size),
+            ("screenshot_sha256", digest),
+        ):
+            if execution[column] != observed:
+                raise LeaseConflict("browser screenshot identity changed")
+        assertions = _load(execution["assertions_json"], {})
+        expected_assertions = {
+            "route": execution["observed_route"] == plan["route"],
+            "title": execution["observed_title"] == plan["expected_title"],
+            "body": execution["observed_body_sha256"]
+            == hashlib.sha256(
+                str(plan["expected_body_text"]).encode("utf-8")
+            ).hexdigest(),
+        }
+        if (
+            assertions.get("route") != expected_assertions["route"]
+            or assertions.get("title") != expected_assertions["title"]
+            or assertions.get("body") != expected_assertions["body"]
+            or execution["outcome"]
+            != ("pass" if all(assertions.values()) else "fail")
+        ):
+            raise LeaseConflict("browser assertion outcome changed")
+        artifact = connection.execute(
+            """SELECT * FROM artifacts
+               WHERE id = ? AND attempt_id = ? AND job_id = ?
+                 AND kind = 'browser_screenshot' AND uri = ?""",
+            (
+                execution["artifact_id"],
+                job["current_attempt_id"],
+                job["id"],
+                execution["screenshot_path"],
+            ),
+        ).fetchone()
+        if artifact is None:
+            raise LeaseConflict("browser screenshot artifact binding is incomplete")
+        return self._row(execution), self._row(artifact)  # type: ignore[return-value]
+
+    def _assert_finished_database_execution(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        execution = connection.execute(
+            """SELECT * FROM database_query_executions
+               WHERE attempt_id = ? AND job_id = ?""",
+            (job["current_attempt_id"], job["id"]),
+        ).fetchone()
+        if (
+            execution is None
+            or execution["status"] != "finished"
+            or execution["work_item_id"] != job["work_item_id"]
+        ):
+            raise LeaseConflict(
+                "current tester attempt has no finished database evidence"
+            )
+        plan_row = connection.execute(
+            "SELECT * FROM database_query_plans WHERE id = ?",
+            (execution["plan_id"],),
+        ).fetchone()
+        if plan_row is None:
+            raise LeaseConflict("database query plan disappeared")
+        plan = self._validated_database_plan_row(connection, plan_row)
+        if (
+            execution["resource_definition_id"]
+            != plan["resource_definition_id"]
+            or execution["resource_identity_hash"]
+            != plan["resource_identity_hash"]
+            or execution["query_sha256"] != plan["query_sha256"]
+        ):
+            raise LeaseConflict("database execution authority changed")
+        details, digest, raw = self._collector_artifact(
+            execution["result_path"],
+            Path(str(execution["result_path"])),
+            execution["result_sha256"],
+            max_bytes=int(plan["max_bytes"]),
+        )
+        payload, observed_ids = self._validated_database_result(
+            raw,
+            int(plan["max_rows"]),
+            int(plan["max_bytes"]),
+            str(plan["id_column"]),
+        )
+        expected_outcome = (
+            "pass"
+            if (
+                (
+                    plan["expected_row_count"] is None
+                    or len(payload["rows"]) == int(plan["expected_row_count"])
+                )
+                and observed_ids == list(plan["expected_ids"])
+                and payload["read_only_proof"]["foreign_key_violations"] == 0
+            )
+            else "fail"
+        )
+        comparisons = {
+            "result_device": details.st_dev,
+            "result_inode": details.st_ino,
+            "result_owner_uid": details.st_uid,
+            "result_mode": details.st_mode,
+            "result_nlink": details.st_nlink,
+            "result_bytes": details.st_size,
+            "result_sha256": digest,
+            "row_count": len(payload["rows"]),
+            "column_count": len(payload["columns"]),
+            "outcome": expected_outcome,
+        }
+        if any(execution[name] != value for name, value in comparisons.items()):
+            raise LeaseConflict("database result identity or outcome changed")
+        if (
+            _load(execution["observed_ids_json"], []) != observed_ids
+            or _load(execution["read_only_proof_json"], {})
+            != payload["read_only_proof"]
+        ):
+            raise LeaseConflict("database result semantics changed")
+        artifact = connection.execute(
+            """SELECT * FROM artifacts
+               WHERE id = ? AND attempt_id = ? AND job_id = ?
+                 AND kind = 'database_result' AND uri = ?""",
+            (
+                execution["artifact_id"],
+                job["current_attempt_id"],
+                job["id"],
+                execution["result_path"],
+            ),
+        ).fetchone()
+        if artifact is None:
+            raise LeaseConflict("database result artifact binding is incomplete")
+        return self._row(execution), self._row(artifact)  # type: ignore[return-value]
+
+    @staticmethod
+    def _canonical_pipeline_handoff(
+        focused: Mapping[str, Any],
+        browser: Optional[Mapping[str, Any]] = None,
+        browser_artifact: Optional[Mapping[str, Any]] = None,
+        database: Optional[Mapping[str, Any]] = None,
+        database_artifact: Optional[Mapping[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        canonical = dict(focused)
+        proofs = list(canonical["gate_proofs"])
+        failures: List[str] = []
+        if canonical["outcome"] != "pass":
+            failures.append(str(canonical["summary"]))
+        if browser is not None and browser_artifact is not None:
+            browser_passed = browser["outcome"] == "pass"
+            browser_summary = (
+                "exact visible route, title, and body assertions passed"
+                if browser_passed
+                else "one or more exact visible browser assertions failed"
+            )
+            proofs.append(
+                {
+                    "gate": "browser",
+                    "result": "pass" if browser_passed else "fail",
+                    "summary": browser_summary,
+                    "evidence": [
+                        {
+                            "id": browser_artifact["id"],
+                            "kind": "screenshot",
+                            "location": browser_artifact["uri"],
+                            "description": (
+                                "Visible Chrome screenshot for the fixed route."
+                            ),
+                            "metadata": {
+                                "attempt_id": browser["attempt_id"],
+                                "execution_id": browser["id"],
+                                "resource_id": browser[
+                                    "resource_definition_id"
+                                ],
+                                "route": browser["observed_route"],
+                                "sha256": browser["screenshot_sha256"],
+                                "bytes": browser["screenshot_bytes"],
+                            },
+                        }
+                    ],
+                }
+            )
+            if not browser_passed:
+                failures.append(browser_summary)
+        if database is not None and database_artifact is not None:
+            database_passed = database["outcome"] == "pass"
+            database_summary = (
+                "fixed read-only query, expected IDs, row count, and foreign keys passed"
+                if database_passed
+                else "one or more fixed database assertions failed"
+            )
+            proofs.append(
+                {
+                    "gate": "database",
+                    "result": "pass" if database_passed else "fail",
+                    "summary": database_summary,
+                    "evidence": [
+                        {
+                            "id": database_artifact["id"],
+                            "kind": "database",
+                            "location": database_artifact["uri"],
+                            "description": (
+                                "Bounded canonical result from the fixed read-only query."
+                            ),
+                            "metadata": {
+                                "attempt_id": database["attempt_id"],
+                                "execution_id": database["id"],
+                                "resource_id": database[
+                                    "resource_definition_id"
+                                ],
+                                "query_sha256": database["query_sha256"],
+                                "result_sha256": database["result_sha256"],
+                                "row_count": database["row_count"],
+                                "read_only_proof": database["read_only_proof"],
+                            },
+                        }
+                    ],
+                }
+            )
+            if not database_passed:
+                failures.append(database_summary)
+        canonical["gate_proofs"] = proofs
+        if failures:
+            canonical["outcome"] = "red"
+            canonical["summary"] = "; ".join(failures)
+            canonical["failure_summary"] = canonical["summary"]
+        else:
+            canonical["outcome"] = "pass"
+            canonical["summary"] = (
+                "focused test, visible browser, and read-only database collectors passed"
+            )
+            canonical["failure_summary"] = None
+        canonical["blocker"] = None
+        return canonical
 
     def _validate_stage_result(
         self,
@@ -4307,11 +7458,15 @@ class SQLiteStore:
                         "work item %s not found" % job["work_item_id"]
                     )
                 required_gates = _load(item["required_gates_json"], [])
-                if not allow_simulated and "focused_tests" in required_gates:
-                    if required_gates != ["focused_tests"]:
+                if not allow_simulated:
+                    if required_gates not in (
+                        ["focused_tests"],
+                        list(DEFAULT_REQUIRED_GATES),
+                    ):
                         raise ValueError(
-                            "tester handoff cannot advance: the authoritative focused "
-                            "collector slice supports exactly the focused_tests gate"
+                            "tester handoff cannot advance: non-simulated evidence "
+                            "requires authoritative focused tests or the fixed "
+                            "three-gate pipeline"
                         )
                     execution = connection.execute(
                         """SELECT * FROM focused_test_executions
@@ -4320,22 +7475,45 @@ class SQLiteStore:
                     ).fetchone()
                     if execution is None:
                         raise ValueError(
-                            "current tester attempt has no authoritative focused execution"
+                            "tester handoff cannot advance: current attempt has no "
+                            "authoritative focused execution"
                         )
                     if execution["canonical_handoff_json"] is None:
                         raise ValueError(
-                            "current focused execution has no persisted canonical handoff"
+                            "tester handoff cannot advance: current focused execution "
+                            "has no persisted canonical handoff"
                         )
                     execution_data, stdout_artifact, stderr_artifact = (
                         self._assert_finished_focused_execution(
                             connection, job, execution
                         )
                     )
-                    handoff = TestHandoff.model_validate(
-                        self._canonical_focused_handoff(
-                            execution_data, stdout_artifact, stderr_artifact
-                        )
+                    focused_handoff = self._canonical_focused_handoff(
+                        execution_data, stdout_artifact, stderr_artifact
                     )
+                    if required_gates == list(DEFAULT_REQUIRED_GATES):
+                        browser = browser_artifact = None
+                        database = database_artifact = None
+                        if focused_handoff["outcome"] == "pass":
+                            browser, browser_artifact = (
+                                self._assert_finished_browser_execution(
+                                    connection, job
+                                )
+                            )
+                            if browser["outcome"] == "pass":
+                                database, database_artifact = (
+                                    self._assert_finished_database_execution(
+                                        connection, job
+                                    )
+                                )
+                        focused_handoff = self._canonical_pipeline_handoff(
+                            focused_handoff,
+                            browser,
+                            browser_artifact,
+                            database,
+                            database_artifact,
+                        )
+                    handoff = TestHandoff.model_validate(focused_handoff)
                 else:
                     handoff = TestHandoff.model_validate(result)
                 evaluation = evaluate_test_handoff(
@@ -4396,6 +7574,7 @@ class SQLiteStore:
         with self._transaction() as connection:
             now = self._clock()
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            self._assert_no_pending_operator_interrupt(connection, job_id)
             if expected_item_state != job["active_item_state"]:
                 raise TransitionConflict("expected state does not match the job active state")
             if next_item_state not in STAGE_NEXT_STATES[job["role"]]:
@@ -4510,6 +7689,43 @@ class SQLiteStore:
                 created_at=now,
             )
 
+    def _end_prepared_evidence_executions(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        *,
+        status: str,
+        reason: str,
+        now: float,
+        actor: Optional[str] = None,
+    ) -> None:
+        if status not in ("abandoned", "quarantined"):
+            raise ValueError("collector execution terminal status is invalid")
+        for table, event_prefix in (
+            ("browser_evidence_executions", "browser_evidence"),
+            ("database_query_executions", "database_evidence"),
+        ):
+            changed = connection.execute(
+                """UPDATE %s SET status = ?, error = ?, finished_at = ?,
+                          updated_at = ?
+                   WHERE attempt_id = ? AND status = 'prepared'""" % table,
+                (status, reason, now, now, job["current_attempt_id"]),
+            ).rowcount
+            if changed:
+                self._append_event(
+                    connection,
+                    "%s.execution_%s" % (event_prefix, status),
+                    campaign_id=job["campaign_id"],
+                    work_item_id=job["work_item_id"],
+                    job_id=job["id"],
+                    actor=actor,
+                    event_data={
+                        "attempt_id": job["current_attempt_id"],
+                        "reason": reason,
+                    },
+                    created_at=now,
+                )
+
     def fail_job(
         self, job_id: str, worker_id: str, lease_token: str, error: str, *,
         result: Optional[Mapping[str, Any]] = None, requeue: bool = True,
@@ -4525,8 +7741,17 @@ class SQLiteStore:
         with self._transaction() as connection:
             now = self._clock()
             job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            self._assert_no_pending_operator_interrupt(connection, job_id)
             self._assert_external_process_stopped(connection, job)
             self._end_prepared_focused_execution(
+                connection,
+                job,
+                status="abandoned",
+                reason=error,
+                now=now,
+                actor=worker_id,
+            )
+            self._end_prepared_evidence_executions(
                 connection,
                 job,
                 status="abandoned",
@@ -4580,9 +7805,22 @@ class SQLiteStore:
                 (status, _dump(dict(result or {})), error,
                  now if available_at is None else available_at, now, job_id),
             )
+            registered_leases = self._registered_job_resource_leases(
+                connection, job_id
+            )
             connection.execute(
                 "DELETE FROM resource_leases WHERE job_id = ? AND lease_token = ?",
                 (job_id, lease_token),
+            )
+            self._append_resource_lease_events(
+                connection,
+                "resource.released",
+                registered_leases,
+                campaign_id=str(job["campaign_id"]),
+                work_item_id=str(job["work_item_id"]),
+                job_id=job_id,
+                actor=worker_id,
+                created_at=now,
             )
             self._append_event(
                 connection, "job.requeued" if will_requeue else "job.failed",
@@ -4621,6 +7859,7 @@ class SQLiteStore:
         lease_token: str,
         *,
         reason: str = "interrupted",
+        operator_request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Record a clean interruption and requeue without treating it as a defect."""
 
@@ -4629,8 +7868,32 @@ class SQLiteStore:
             job = self._assert_live_lease(
                 connection, job_id, worker_id, lease_token, now
             )
+            operator_request = None
+            if operator_request_id is not None:
+                operator_request = self._assert_operator_interrupt_request(
+                    connection,
+                    operator_request_id,
+                    job,
+                    worker_id,
+                    lease_token,
+                    allow_stopped_process=True,
+                )
+                if reason != operator_request["reason"]:
+                    raise LeaseConflict(
+                        "operator interrupt reason differs from its request"
+                    )
+            else:
+                self._assert_no_pending_operator_interrupt(connection, job_id)
             self._assert_external_process_stopped(connection, job)
             self._end_prepared_focused_execution(
+                connection,
+                job,
+                status="abandoned",
+                reason=reason,
+                now=now,
+                actor=worker_id,
+            )
+            self._end_prepared_evidence_executions(
                 connection,
                 job,
                 status="abandoned",
@@ -4662,9 +7925,22 @@ class SQLiteStore:
                    WHERE id = ?""",
                 (reason, now, now, job_id),
             )
+            registered_leases = self._registered_job_resource_leases(
+                connection, job_id
+            )
             connection.execute(
                 "DELETE FROM resource_leases WHERE job_id = ? AND lease_token = ?",
                 (job_id, lease_token),
+            )
+            self._append_resource_lease_events(
+                connection,
+                "resource.released",
+                registered_leases,
+                campaign_id=str(job["campaign_id"]),
+                work_item_id=str(job["work_item_id"]),
+                job_id=job_id,
+                actor=worker_id,
+                created_at=now,
             )
             self._append_event(
                 connection,
@@ -4675,11 +7951,37 @@ class SQLiteStore:
                 actor=worker_id,
                 event_data={
                     "reason": reason,
+                    "operator_request_id": operator_request_id,
                     "from_state": job["active_item_state"],
                     "to_state": job["queued_item_state"],
                 },
                 created_at=now,
             )
+            if operator_request is not None:
+                changed = connection.execute(
+                    """UPDATE operator_controls
+                       SET status = 'applied', target_attempt_id = ?, applied_at = ?
+                       WHERE id = ? AND status = 'pending'""",
+                    (job["current_attempt_id"], now, operator_request_id),
+                ).rowcount
+                if changed != 1:
+                    raise LeaseConflict(
+                        "operator interrupt request was consumed concurrently"
+                    )
+                self._append_event(
+                    connection,
+                    "operator.interrupt_applied",
+                    campaign_id=job["campaign_id"],
+                    work_item_id=job["work_item_id"],
+                    job_id=job_id,
+                    actor=operator_request["requested_by"],
+                    event_data={
+                        "request_id": operator_request_id,
+                        "attempt_id": job["current_attempt_id"],
+                        "reason": reason,
+                    },
+                    created_at=now,
+                )
         return self.get_job(job_id)
 
     def recover_expired_leases(self) -> Dict[str, Any]:
@@ -4696,6 +7998,38 @@ class SQLiteStore:
         error: str,
         event_data: Optional[Mapping[str, Any]] = None,
     ) -> None:
+        pending_interrupt = connection.execute(
+            """SELECT * FROM operator_controls
+               WHERE job_id = ? AND action = 'interrupt'
+                 AND status = 'pending'""",
+            (job["id"],),
+        ).fetchone()
+        if pending_interrupt is not None:
+            rejected_reason = "%s before the operator interrupt was applied" % error
+            changed = connection.execute(
+                """UPDATE operator_controls
+                   SET status = 'rejected', last_error = ?
+                   WHERE id = ? AND status = 'pending'""",
+                (rejected_reason, pending_interrupt["id"]),
+            ).rowcount
+            if changed != 1:
+                raise LeaseConflict(
+                    "pending operator interrupt changed during recovery"
+                )
+            self._append_event(
+                connection,
+                "operator.interrupt_rejected",
+                campaign_id=job["campaign_id"],
+                work_item_id=job["work_item_id"],
+                job_id=job["id"],
+                actor=pending_interrupt["requested_by"],
+                event_data={
+                    "request_id": pending_interrupt["id"],
+                    "attempt_id": job["current_attempt_id"],
+                    "reason": rejected_reason,
+                },
+                created_at=now,
+            )
         expected_resources = set(_load(job["required_resources_json"], []))
         persisted_resources = connection.execute(
             """SELECT resource_key, owner_id, lease_token
@@ -4711,6 +8045,9 @@ class SQLiteStore:
             raise LeaseConflict(
                 "expired job resource fences changed before recovery"
             )
+        registered_leases = self._registered_job_resource_leases(
+            connection, str(job["id"])
+        )
         changed = connection.execute(
             "UPDATE work_items SET state = ?, updated_at = ? WHERE id = ? AND state = ?",
             (
@@ -4725,6 +8062,13 @@ class SQLiteStore:
                 "cannot recover expired job because item state is inconsistent"
             )
         self._end_prepared_focused_execution(
+            connection,
+            job,
+            status="abandoned",
+            reason=error,
+            now=now,
+        )
+        self._end_prepared_evidence_executions(
             connection,
             job,
             status="abandoned",
@@ -4761,6 +8105,16 @@ class SQLiteStore:
         ).rowcount
         if released != len(expected_resources):
             raise LeaseConflict("expired resource fences changed during recovery")
+        self._append_resource_lease_events(
+            connection,
+            "resource.recovered",
+            registered_leases,
+            campaign_id=str(job["campaign_id"]),
+            work_item_id=str(job["work_item_id"]),
+            job_id=str(job["id"]),
+            actor=(None if job["lease_owner"] is None else str(job["lease_owner"])),
+            created_at=now,
+        )
         details = {
             "from_state": job["active_item_state"],
             "to_state": job["queued_item_state"],
@@ -4820,22 +8174,43 @@ class SQLiteStore:
             recovered_jobs += 1
             recovered_job_ids.append(str(job["id"]))
         orphaned = connection.execute(
-            """SELECT r.* FROM resource_leases r
+            """SELECT r.*, j.campaign_id AS job_campaign_id,
+                      j.work_item_id AS job_work_item_id,
+                      d.kind AS resource_kind, d.label AS resource_label,
+                      d.policy_json AS resource_policy_json,
+                      d.campaign_id AS resource_campaign_id
+               FROM resource_leases r
                LEFT JOIN jobs j ON j.id = r.job_id
+               LEFT JOIN resource_definitions d
+                 ON d.id = r.resource_definition_id
                WHERE r.expires_at <= ?
                  AND (r.job_id IS NULL OR j.status IS NULL OR j.status != 'running')""",
             (now,),
         ).fetchall()
         for lease in orphaned:
             connection.execute(
-                "DELETE FROM resource_leases WHERE resource_key = ?",
-                (lease["resource_key"],),
+                """DELETE FROM resource_leases
+                   WHERE resource_key = ? AND lease_slot = ?""",
+                (lease["resource_key"], lease["lease_slot"]),
             )
-            self._append_event(
-                connection, "resource.lease_expired", job_id=lease["job_id"],
-                actor=lease["owner_id"], event_data={"resource_key": lease["resource_key"]},
-                created_at=now
-            )
+            if lease["resource_definition_id"] is None:
+                self._append_event(
+                    connection, "resource.lease_expired", job_id=lease["job_id"],
+                    actor=lease["owner_id"],
+                    event_data={"resource_key": lease["resource_key"]},
+                    created_at=now
+                )
+            else:
+                self._append_resource_lease_events(
+                    connection,
+                    "resource.recovered",
+                    [lease],
+                    campaign_id=str(lease["job_campaign_id"]),
+                    work_item_id=str(lease["job_work_item_id"]),
+                    job_id=str(lease["job_id"]),
+                    actor=str(lease["owner_id"]),
+                    created_at=now,
+                )
         result = {
             "jobs": recovered_jobs,
             "resources": len(orphaned),
@@ -4956,13 +8331,23 @@ class SQLiteStore:
         with self._transaction() as connection:
             now = self._clock()
             external = connection.execute(
-                "SELECT * FROM external_processes WHERE attempt_id = ?",
-                (attempt_id,),
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ?
+                     AND reconciliation_owner = ?
+                     AND reconciliation_token = ?
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (attempt_id, owner, reconciliation_token),
             ).fetchone()
             if external is None:
-                raise NotFoundError(
-                    "external process for attempt %s not found" % attempt_id
-                )
+                exists = connection.execute(
+                    "SELECT 1 FROM external_processes WHERE attempt_id = ? LIMIT 1",
+                    (attempt_id,),
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError(
+                        "external process for attempt %s not found" % attempt_id
+                    )
+                raise LeaseConflict("external process reconciliation fence is stale")
             job = connection.execute(
                 "SELECT * FROM jobs WHERE id = ?", (external["job_id"],)
             ).fetchone()
@@ -5013,6 +8398,14 @@ class SQLiteStore:
             }
             if status == "quarantined":
                 self._end_prepared_focused_execution(
+                    connection,
+                    job,
+                    status="quarantined",
+                    reason=reason,
+                    now=now,
+                    actor=owner,
+                )
+                self._end_prepared_evidence_executions(
                     connection,
                     job,
                     status="quarantined",
@@ -5113,7 +8506,13 @@ class SQLiteStore:
                          ep.last_error AS external_process_last_error,
                          ep.stopped_at AS external_process_stopped_at
                   FROM attempts a JOIN jobs j ON j.id = a.job_id
-                  LEFT JOIN external_processes ep ON ep.attempt_id = a.id"""
+                  LEFT JOIN external_processes ep ON ep.id = (
+                      SELECT latest_process.id
+                      FROM external_processes latest_process
+                      WHERE latest_process.attempt_id = a.id
+                      ORDER BY latest_process.recorded_at DESC,
+                               latest_process.id DESC
+                      LIMIT 1)"""
         clauses: List[str] = []
         parameters: List[Any] = []
         if job_id is not None:
@@ -5140,11 +8539,16 @@ class SQLiteStore:
             raise ValueError("lease_seconds must be positive")
         if job_id is not None:
             raise ValueError("job-bound resources are acquired only through job claims")
+        resource_key = _reject_registered_resource_alias(resource_key)
+        resource_key = _reject_unsafe_collector_text(resource_key, "resource key")
+        owner_id = _operator_text(owner_id, "resource lease owner", 256)
         token = _id()
         with self._transaction() as connection:
             now = self._clock()
             existing = connection.execute(
-                "SELECT * FROM resource_leases WHERE resource_key = ?", (resource_key,)
+                """SELECT * FROM resource_leases
+                   WHERE resource_key = ? AND lease_slot = 1""",
+                (resource_key,),
             ).fetchone()
             if existing is not None and existing["job_id"] is not None:
                 return None
@@ -5152,17 +8556,47 @@ class SQLiteStore:
                 return None
             if existing is not None:
                 connection.execute(
-                    "DELETE FROM resource_leases WHERE resource_key = ?", (resource_key,)
+                    """DELETE FROM resource_leases
+                       WHERE resource_key = ? AND lease_slot = 1""",
+                    (resource_key,),
+                )
+                self._append_event(
+                    connection,
+                    "resource.lease_expired",
+                    actor=owner_id,
+                    event_data={"resource_key": resource_key, "lease_slot": 1},
+                    created_at=now,
                 )
             connection.execute(
                 """INSERT INTO resource_leases
-                   (resource_key, owner_id, job_id, lease_token, acquired_at,
-                    heartbeat_at, expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (resource_key, owner_id, job_id, token, now, now, now + lease_seconds),
+                   (resource_key, lease_slot, resource_definition_id, owner_id,
+                    job_id, lease_token, acquired_at, heartbeat_at, expires_at)
+                   VALUES (?, 1, NULL, ?, ?, ?, ?, ?, ?)""",
+                (
+                    resource_key,
+                    owner_id,
+                    job_id,
+                    token,
+                    now,
+                    now,
+                    now + lease_seconds,
+                ),
+            )
+            self._append_event(
+                connection,
+                "resource.acquired",
+                actor=owner_id,
+                event_data={
+                    "resource_key": resource_key,
+                    "lease_slot": 1,
+                    "expires_at": now + lease_seconds,
+                },
+                created_at=now,
             )
             row = connection.execute(
-                "SELECT * FROM resource_leases WHERE resource_key = ?", (resource_key,)
+                """SELECT * FROM resource_leases
+                   WHERE resource_key = ? AND lease_slot = 1""",
+                (resource_key,),
             ).fetchone()
             return self._row(row)
 
@@ -5171,10 +8605,14 @@ class SQLiteStore:
     ) -> bool:
         if lease_seconds <= 0:
             raise ValueError("lease_seconds must be positive")
+        resource_key = _reject_registered_resource_alias(resource_key)
+        resource_key = _reject_unsafe_collector_text(resource_key, "resource key")
+        owner_id = _operator_text(owner_id, "resource lease owner", 256)
         with self._transaction() as connection:
             now = self._clock()
             existing = connection.execute(
-                "SELECT job_id FROM resource_leases WHERE resource_key = ?",
+                """SELECT job_id FROM resource_leases
+                   WHERE resource_key = ? AND lease_slot = 1""",
                 (resource_key,),
             ).fetchone()
             if existing is not None and existing["job_id"] is not None:
@@ -5183,16 +8621,34 @@ class SQLiteStore:
                 )
             changed = connection.execute(
                 """UPDATE resource_leases SET heartbeat_at = ?, expires_at = ?
-                   WHERE resource_key = ? AND owner_id = ? AND lease_token = ?
+                   WHERE resource_key = ? AND lease_slot = 1
+                     AND owner_id = ? AND lease_token = ?
                      AND expires_at > ?""",
                 (now, now + lease_seconds, resource_key, owner_id, lease_token, now),
             ).rowcount
+            if changed == 1:
+                self._append_event(
+                    connection,
+                    "resource.heartbeat",
+                    actor=owner_id,
+                    event_data={
+                        "resource_key": resource_key,
+                        "lease_slot": 1,
+                        "expires_at": now + lease_seconds,
+                    },
+                    created_at=now,
+                )
         return changed == 1
 
     def release_resource(self, resource_key: str, owner_id: str, lease_token: str) -> bool:
+        resource_key = _reject_registered_resource_alias(resource_key)
+        resource_key = _reject_unsafe_collector_text(resource_key, "resource key")
+        owner_id = _operator_text(owner_id, "resource lease owner", 256)
         with self._transaction() as connection:
+            now = self._clock()
             existing = connection.execute(
-                "SELECT job_id FROM resource_leases WHERE resource_key = ?",
+                """SELECT job_id FROM resource_leases
+                   WHERE resource_key = ? AND lease_slot = 1""",
                 (resource_key,),
             ).fetchone()
             if existing is not None and existing["job_id"] is not None:
@@ -5201,9 +8657,18 @@ class SQLiteStore:
                 )
             changed = connection.execute(
                 """DELETE FROM resource_leases
-                   WHERE resource_key = ? AND owner_id = ? AND lease_token = ?""",
+                   WHERE resource_key = ? AND lease_slot = 1
+                     AND owner_id = ? AND lease_token = ?""",
                 (resource_key, owner_id, lease_token),
             ).rowcount
+            if changed == 1:
+                self._append_event(
+                    connection,
+                    "resource.released",
+                    actor=owner_id,
+                    event_data={"resource_key": resource_key, "lease_slot": 1},
+                    created_at=now,
+                )
         return changed == 1
 
     def list_resource_leases(
@@ -5214,10 +8679,12 @@ class SQLiteStore:
         if campaign_id is not None:
             sql += " JOIN jobs j ON j.id = r.job_id WHERE j.campaign_id = ?"
             parameters = (campaign_id,)
-        sql += " ORDER BY r.resource_key"
+        sql += " ORDER BY r.resource_key, r.lease_slot"
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
-        return self._rows(rows)
+            return self._safe_resource_lease_records(
+                self._connection, rows
+            )
 
     def add_event(
         self, event_kind: str, *, campaign_id: Optional[str] = None,
@@ -5835,4 +9302,356 @@ _SCHEMA_V7 = [
        ON resource_leases(job_id, resource_key)""",
     """CREATE INDEX managed_worktrees_campaign
        ON managed_worktrees(campaign_id, created_at, id)""",
+]
+
+
+_SCHEMA_V8 = [
+    """CREATE TABLE resource_definitions (
+        id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        label TEXT NOT NULL,
+        enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+        configuration_json TEXT NOT NULL,
+        campaign_id TEXT REFERENCES campaigns(id) ON DELETE RESTRICT,
+        metadata_json TEXT NOT NULL,
+        policy_json TEXT NOT NULL,
+        identity_hash TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        CHECK(kind IN ('chrome_profile', 'tenant_database',
+                       'queue_environment', 'test_fixture')),
+        CHECK(length(id) = 36 AND substr(id, 1, 4) = 'res_'
+              AND substr(id, 5) NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(identity_hash) = 64
+              AND identity_hash NOT GLOB '*[^0-9a-f]*'),
+        UNIQUE(kind, identity_hash))""",
+    """CREATE INDEX resource_definitions_campaign
+       ON resource_definitions(campaign_id, enabled, kind, label, id)""",
+    """CREATE TABLE resource_leases_v8 (
+        resource_key TEXT NOT NULL,
+        lease_slot INTEGER NOT NULL CHECK(lease_slot > 0),
+        resource_definition_id TEXT
+            REFERENCES resource_definitions(id) ON DELETE RESTRICT,
+        owner_id TEXT NOT NULL,
+        job_id TEXT REFERENCES jobs(id) ON DELETE CASCADE,
+        lease_token TEXT NOT NULL,
+        acquired_at REAL NOT NULL,
+        heartbeat_at REAL NOT NULL,
+        expires_at REAL NOT NULL,
+        PRIMARY KEY(resource_key, lease_slot),
+        CHECK(resource_definition_id IS NULL
+              OR resource_definition_id = resource_key),
+        CHECK(resource_definition_id IS NULL OR job_id IS NOT NULL))""",
+    """INSERT INTO resource_leases_v8
+       (resource_key, lease_slot, resource_definition_id, owner_id, job_id,
+        lease_token, acquired_at, heartbeat_at, expires_at)
+       SELECT resource_key, 1, NULL, owner_id, job_id, lease_token,
+              acquired_at, heartbeat_at, expires_at
+       FROM resource_leases""",
+    "DROP TABLE resource_leases",
+    "ALTER TABLE resource_leases_v8 RENAME TO resource_leases",
+    "CREATE INDEX resource_lease_expiry ON resource_leases(expires_at)",
+    """CREATE INDEX resource_leases_job
+       ON resource_leases(job_id, resource_key, lease_slot)""",
+    """CREATE INDEX resource_leases_definition
+       ON resource_leases(resource_definition_id, lease_slot)""",
+]
+
+
+_SCHEMA_V9 = [
+    "ALTER TABLE resource_definitions ADD COLUMN definition_hash TEXT",
+    "ALTER TABLE resource_leases ADD COLUMN resource_identity_hash TEXT",
+    "ALTER TABLE external_processes RENAME TO external_processes_v4",
+    "DROP INDEX one_live_external_process_identity",
+    "DROP INDEX external_process_reconciliation_queue",
+    """CREATE TABLE external_processes (
+        id TEXT PRIMARY KEY,
+        attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        process_id INTEGER NOT NULL CHECK(process_id > 1),
+        process_group_id INTEGER NOT NULL CHECK(process_group_id > 1),
+        owner_uid INTEGER,
+        start_seconds INTEGER,
+        start_microseconds INTEGER,
+        kernel_executable TEXT,
+        target_executable TEXT,
+        identity_version TEXT NOT NULL,
+        state TEXT NOT NULL,
+        recorded_at REAL NOT NULL,
+        stopped_at REAL,
+        outcome TEXT,
+        reconciliation_owner TEXT,
+        reconciliation_token TEXT,
+        reconciliation_expires_at REAL,
+        last_error TEXT,
+        updated_at REAL NOT NULL,
+        CHECK(identity_version IN ('darwin_libproc_v1', 'legacy_v3')),
+        CHECK(state IN ('active', 'legacy_unverifiable', 'quarantined', 'stopped')),
+        CHECK(start_microseconds IS NULL
+              OR (start_microseconds >= 0 AND start_microseconds < 1000000)),
+        CHECK(identity_version != 'darwin_libproc_v1'
+              OR (owner_uid IS NOT NULL AND owner_uid >= 0
+                  AND start_seconds IS NOT NULL AND start_seconds > 0
+                  AND start_microseconds IS NOT NULL
+                  AND kernel_executable IS NOT NULL
+                  AND target_executable IS NOT NULL)),
+        CHECK((state = 'stopped' AND stopped_at IS NOT NULL)
+              OR (state != 'stopped' AND stopped_at IS NULL)),
+        CHECK((reconciliation_owner IS NULL AND reconciliation_token IS NULL
+               AND reconciliation_expires_at IS NULL)
+              OR (reconciliation_owner IS NOT NULL AND reconciliation_token IS NOT NULL
+                  AND reconciliation_expires_at IS NOT NULL)))""",
+    """INSERT INTO external_processes
+       SELECT * FROM external_processes_v4""",
+    "DROP TABLE external_processes_v4",
+    """CREATE UNIQUE INDEX one_live_external_process_identity
+       ON external_processes(process_id, start_seconds, start_microseconds)
+       WHERE state != 'stopped'""",
+    """CREATE UNIQUE INDEX one_live_external_process_per_attempt
+       ON external_processes(attempt_id) WHERE state != 'stopped'""",
+    """CREATE INDEX external_process_attempt_history
+       ON external_processes(attempt_id, recorded_at, id)""",
+    """CREATE INDEX external_process_reconciliation_queue
+       ON external_processes(state, reconciliation_expires_at, recorded_at)""",
+    """CREATE UNIQUE INDEX attempts_id_job
+       ON attempts(id, job_id)""",
+    """CREATE UNIQUE INDEX jobs_id_item
+       ON jobs(id, work_item_id)""",
+    """CREATE TABLE browser_evidence_plans (
+        id TEXT PRIMARY KEY,
+        work_item_id TEXT NOT NULL
+            REFERENCES work_items(id) ON DELETE CASCADE,
+        plan_number INTEGER NOT NULL CHECK(plan_number > 0),
+        resource_definition_id TEXT NOT NULL
+            REFERENCES resource_definitions(id) ON DELETE RESTRICT,
+        resource_identity_hash TEXT NOT NULL,
+        route TEXT NOT NULL,
+        route_device INTEGER NOT NULL CHECK(route_device >= 0),
+        route_inode INTEGER NOT NULL CHECK(route_inode >= 0),
+        route_owner_uid INTEGER NOT NULL CHECK(route_owner_uid >= 0),
+        route_mode INTEGER NOT NULL CHECK(route_mode > 0),
+        route_nlink INTEGER NOT NULL CHECK(route_nlink > 0),
+        route_bytes INTEGER NOT NULL CHECK(route_bytes > 0),
+        route_sha256 TEXT NOT NULL,
+        expected_title TEXT NOT NULL,
+        expected_body_text TEXT NOT NULL,
+        runtime_root TEXT NOT NULL,
+        timeout_seconds REAL NOT NULL CHECK(timeout_seconds > 0),
+        plan_sha256 TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE(work_item_id, plan_number),
+        UNIQUE(work_item_id, plan_sha256),
+        UNIQUE(id, work_item_id, resource_definition_id),
+        CHECK(length(resource_identity_hash) = 64
+              AND resource_identity_hash NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(route_sha256) = 64
+              AND route_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(plan_sha256) = 64
+              AND plan_sha256 NOT GLOB '*[^0-9a-f]*'))""",
+    """CREATE INDEX browser_evidence_plan_resource
+       ON browser_evidence_plans(resource_definition_id, work_item_id)""",
+    """CREATE TABLE browser_evidence_executions (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL
+            REFERENCES browser_evidence_plans(id) ON DELETE CASCADE,
+        attempt_id TEXT NOT NULL UNIQUE
+            REFERENCES attempts(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        resource_definition_id TEXT NOT NULL
+            REFERENCES resource_definitions(id) ON DELETE RESTRICT,
+        resource_identity_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        outcome TEXT,
+        requested_route TEXT NOT NULL,
+        observed_route TEXT,
+        observed_title TEXT,
+        observed_body_sha256 TEXT,
+        assertions_json TEXT,
+        run_parent TEXT NOT NULL,
+        screenshot_path TEXT NOT NULL UNIQUE,
+        screenshot_device INTEGER,
+        screenshot_inode INTEGER,
+        screenshot_owner_uid INTEGER,
+        screenshot_mode INTEGER,
+        screenshot_nlink INTEGER,
+        screenshot_bytes INTEGER,
+        screenshot_sha256 TEXT,
+        artifact_id TEXT REFERENCES artifacts(id),
+        error TEXT,
+        prepared_at REAL NOT NULL,
+        finished_at REAL,
+        updated_at REAL NOT NULL,
+        FOREIGN KEY(plan_id, work_item_id, resource_definition_id)
+            REFERENCES browser_evidence_plans(
+                id, work_item_id, resource_definition_id) ON DELETE CASCADE,
+        FOREIGN KEY(attempt_id, job_id)
+            REFERENCES attempts(id, job_id) ON DELETE CASCADE,
+        FOREIGN KEY(job_id, work_item_id)
+            REFERENCES jobs(id, work_item_id) ON DELETE CASCADE,
+        CHECK(status IN ('prepared', 'finished', 'abandoned', 'quarantined')),
+        CHECK(outcome IS NULL OR outcome IN ('pass', 'fail')),
+        CHECK((status = 'finished' AND outcome IS NOT NULL
+               AND observed_route IS NOT NULL AND observed_title IS NOT NULL
+               AND observed_body_sha256 IS NOT NULL
+               AND assertions_json IS NOT NULL AND screenshot_device IS NOT NULL
+               AND screenshot_inode IS NOT NULL AND screenshot_owner_uid IS NOT NULL
+               AND screenshot_mode IS NOT NULL AND screenshot_nlink IS NOT NULL
+               AND screenshot_bytes IS NOT NULL AND screenshot_sha256 IS NOT NULL
+               AND artifact_id IS NOT NULL AND finished_at IS NOT NULL)
+              OR status != 'finished'),
+        CHECK((status = 'prepared' AND outcome IS NULL
+               AND observed_route IS NULL AND observed_title IS NULL
+               AND observed_body_sha256 IS NULL AND assertions_json IS NULL
+               AND screenshot_sha256 IS NULL AND artifact_id IS NULL
+               AND error IS NULL AND finished_at IS NULL)
+              OR status != 'prepared'),
+        CHECK(length(resource_identity_hash) = 64
+              AND resource_identity_hash NOT GLOB '*[^0-9a-f]*'),
+        CHECK(screenshot_sha256 IS NULL OR
+              (length(screenshot_sha256) = 64
+               AND screenshot_sha256 NOT GLOB '*[^0-9a-f]*')),
+        CHECK(observed_body_sha256 IS NULL OR
+              (length(observed_body_sha256) = 64
+               AND observed_body_sha256 NOT GLOB '*[^0-9a-f]*')))""",
+    """CREATE INDEX browser_evidence_execution_item
+       ON browser_evidence_executions(work_item_id, prepared_at)""",
+    """CREATE TABLE database_query_plans (
+        id TEXT PRIMARY KEY,
+        work_item_id TEXT NOT NULL
+            REFERENCES work_items(id) ON DELETE CASCADE,
+        plan_number INTEGER NOT NULL CHECK(plan_number > 0),
+        resource_definition_id TEXT NOT NULL
+            REFERENCES resource_definitions(id) ON DELETE RESTRICT,
+        resource_identity_hash TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        parameters_json TEXT NOT NULL,
+        query_sha256 TEXT NOT NULL,
+        id_column TEXT NOT NULL,
+        expected_ids_json TEXT NOT NULL,
+        expected_row_count INTEGER CHECK(expected_row_count IS NULL
+                                         OR expected_row_count >= 0),
+        max_rows INTEGER NOT NULL CHECK(max_rows > 0),
+        max_bytes INTEGER NOT NULL CHECK(max_bytes > 0),
+        timeout_seconds REAL NOT NULL CHECK(timeout_seconds > 0),
+        runtime_root TEXT NOT NULL,
+        plan_sha256 TEXT NOT NULL,
+        created_at REAL NOT NULL,
+        UNIQUE(work_item_id, plan_number),
+        UNIQUE(work_item_id, plan_sha256),
+        UNIQUE(id, work_item_id, resource_definition_id),
+        CHECK(length(resource_identity_hash) = 64
+              AND resource_identity_hash NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(query_sha256) = 64
+              AND query_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(plan_sha256) = 64
+              AND plan_sha256 NOT GLOB '*[^0-9a-f]*'))""",
+    """CREATE INDEX database_query_plan_resource
+       ON database_query_plans(resource_definition_id, work_item_id)""",
+    """CREATE TABLE database_query_executions (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL
+            REFERENCES database_query_plans(id) ON DELETE CASCADE,
+        attempt_id TEXT NOT NULL UNIQUE
+            REFERENCES attempts(id) ON DELETE CASCADE,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+        resource_definition_id TEXT NOT NULL
+            REFERENCES resource_definitions(id) ON DELETE RESTRICT,
+        resource_identity_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        outcome TEXT,
+        query_sha256 TEXT NOT NULL,
+        row_count INTEGER,
+        column_count INTEGER,
+        observed_ids_json TEXT,
+        read_only_proof_json TEXT,
+        run_parent TEXT NOT NULL,
+        result_path TEXT NOT NULL UNIQUE,
+        result_device INTEGER,
+        result_inode INTEGER,
+        result_owner_uid INTEGER,
+        result_mode INTEGER,
+        result_nlink INTEGER,
+        result_bytes INTEGER,
+        result_sha256 TEXT,
+        artifact_id TEXT REFERENCES artifacts(id),
+        error TEXT,
+        prepared_at REAL NOT NULL,
+        finished_at REAL,
+        updated_at REAL NOT NULL,
+        FOREIGN KEY(plan_id, work_item_id, resource_definition_id)
+            REFERENCES database_query_plans(
+                id, work_item_id, resource_definition_id) ON DELETE CASCADE,
+        FOREIGN KEY(attempt_id, job_id)
+            REFERENCES attempts(id, job_id) ON DELETE CASCADE,
+        FOREIGN KEY(job_id, work_item_id)
+            REFERENCES jobs(id, work_item_id) ON DELETE CASCADE,
+        CHECK(status IN ('prepared', 'finished', 'abandoned', 'quarantined')),
+        CHECK(outcome IS NULL OR outcome IN ('pass', 'fail')),
+        CHECK((status = 'finished' AND outcome IS NOT NULL
+               AND row_count IS NOT NULL AND column_count IS NOT NULL
+               AND observed_ids_json IS NOT NULL
+               AND read_only_proof_json IS NOT NULL
+               AND result_sha256 IS NOT NULL AND artifact_id IS NOT NULL
+               AND finished_at IS NOT NULL)
+              OR status != 'finished'),
+        CHECK((status = 'prepared' AND outcome IS NULL
+               AND row_count IS NULL AND column_count IS NULL
+               AND observed_ids_json IS NULL AND read_only_proof_json IS NULL
+               AND result_sha256 IS NULL AND artifact_id IS NULL
+               AND error IS NULL AND finished_at IS NULL)
+              OR status != 'prepared'),
+        CHECK(length(resource_identity_hash) = 64
+              AND resource_identity_hash NOT GLOB '*[^0-9a-f]*'),
+        CHECK(length(query_sha256) = 64
+              AND query_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK(result_sha256 IS NULL OR
+              (length(result_sha256) = 64
+               AND result_sha256 NOT GLOB '*[^0-9a-f]*')))""",
+    """CREATE INDEX database_query_execution_item
+       ON database_query_executions(work_item_id, prepared_at)""",
+    """CREATE TABLE operator_controls (
+        id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+        source_attempt_id TEXT NOT NULL REFERENCES attempts(id) ON DELETE CASCADE,
+        target_attempt_id TEXT REFERENCES attempts(id) ON DELETE SET NULL,
+        action TEXT NOT NULL CHECK(action IN ('interrupt', 'resume')),
+        status TEXT NOT NULL CHECK(status IN ('pending', 'applied', 'rejected')),
+        requested_by TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        expected_lease_owner TEXT,
+        expected_lease_token TEXT,
+        expected_provider TEXT,
+        expected_session_id TEXT,
+        expected_process_id INTEGER,
+        expected_process_group_id INTEGER,
+        expected_process_start_seconds INTEGER,
+        expected_process_start_microseconds INTEGER,
+        expected_process_executable TEXT,
+        expected_worktree_id TEXT,
+        expected_worktree_generation INTEGER,
+        expected_resources_json TEXT NOT NULL,
+        expected_resources_sha256 TEXT NOT NULL,
+        requested_at REAL NOT NULL,
+        applied_at REAL,
+        last_error TEXT,
+        CHECK(length(expected_resources_sha256) = 64
+              AND expected_resources_sha256 NOT GLOB '*[^0-9a-f]*'),
+        CHECK((status = 'pending' AND target_attempt_id IS NULL
+               AND applied_at IS NULL AND last_error IS NULL)
+              OR status != 'pending'),
+        CHECK((status = 'applied' AND applied_at IS NOT NULL)
+              OR status != 'applied'),
+        CHECK((action = 'interrupt' AND expected_lease_owner IS NOT NULL
+               AND expected_lease_token IS NOT NULL)
+              OR action != 'interrupt'),
+        CHECK((action = 'resume' AND expected_provider IS NOT NULL
+               AND expected_session_id IS NOT NULL)
+              OR action != 'resume'))""",
+    """CREATE UNIQUE INDEX one_pending_operator_control
+       ON operator_controls(job_id, action) WHERE status = 'pending'""",
+    """CREATE INDEX operator_control_history
+       ON operator_controls(job_id, requested_at, id)""",
 ]

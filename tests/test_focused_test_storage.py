@@ -256,7 +256,7 @@ def test_schema_v5_migrates_focused_tables_and_attempt_artifact_fk(
         connection.close()
 
     with SQLiteStore(path) as store:
-        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 7
+        assert store._connection.execute("PRAGMA user_version").fetchone()[0] == 9
         tables = {
             row["name"]
             for row in store._connection.execute(
@@ -274,7 +274,7 @@ def test_schema_v5_migrates_focused_tables_and_attempt_artifact_fk(
             ).fetchall()
         }
 
-    assert SCHEMA_VERSION == 7
+    assert SCHEMA_VERSION == 9
     assert {"focused_test_plans", "focused_test_executions"}.issubset(tables)
     assert "attempt_id" in artifact_columns
     assert ("attempt_id", "attempts") in artifact_fks

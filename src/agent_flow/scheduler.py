@@ -81,6 +81,22 @@ class Storage(Protocol):
     ) -> bool:
         """Extend a fenced job/resource lease, or reject a stale owner."""
 
+    def poll_operator_interrupt(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        """Return a pending interrupt only when every persisted fence matches."""
+
+    def complete_operator_interrupt(
+        self,
+        *,
+        request_id: str,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        reason: str,
+    ) -> bool:
+        """Atomically apply one exact request after process-group reap."""
+
     def record_external_session(
         self,
         job_id: str,
@@ -142,6 +158,34 @@ class Storage(Protocol):
     ) -> Optional[Mapping[str, Any]]:
         """Validate and persist authoritative focused-test output."""
 
+    def prepare_browser_evidence_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        """Prepare one fixed visible-browser request for this tester attempt."""
+
+    def complete_browser_evidence_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """Validate and persist one fixed browser-evidence result."""
+
+    def prepare_database_query_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        """Prepare one fixed read-only database request for this tester attempt."""
+
+    def complete_database_query_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        """Validate and persist one fixed database-evidence result."""
+
     def commit_stage_result(
         self,
         *,
@@ -188,6 +232,15 @@ class LeaseLost(RuntimeError):
 
 class HeartbeatStorageFailure(RuntimeError):
     """Heartbeat storage remained unavailable after bounded retries."""
+
+
+class OperatorInterruption(RuntimeError):
+    """A durable exact-fence operator request cancelled the active worker."""
+
+    def __init__(self, request_id: str, reason: str) -> None:
+        super().__init__(reason)
+        self.request_id = request_id
+        self.reason = reason
 
 
 @dataclass
@@ -545,6 +598,22 @@ class Scheduler:
             ) -> Mapping[str, Any]:
                 return self._complete_focused_test_execution(slot, job, result)
 
+            def prepare_browser_evidence_execution() -> Mapping[str, Any]:
+                return self._prepare_browser_evidence_execution(slot, job)
+
+            def complete_browser_evidence_execution(
+                result: Mapping[str, Any],
+            ) -> Mapping[str, Any]:
+                return self._complete_browser_evidence_execution(slot, job, result)
+
+            def prepare_database_query_execution() -> Mapping[str, Any]:
+                return self._prepare_database_query_execution(slot, job)
+
+            def complete_database_query_execution(
+                result: Mapping[str, Any],
+            ) -> Mapping[str, Any]:
+                return self._complete_database_query_execution(slot, job, result)
+
             context = WorkerContext(
                 campaign=campaign,
                 item=item,
@@ -557,13 +626,34 @@ class Scheduler:
                 _managed_worktree_quarantiner=quarantine_managed_worktree,
                 _focused_test_execution_preparer=prepare_focused_test_execution,
                 _focused_test_execution_completer=complete_focused_test_execution,
+                _browser_evidence_execution_preparer=(
+                    prepare_browser_evidence_execution
+                ),
+                _browser_evidence_execution_completer=(
+                    complete_browser_evidence_execution
+                ),
+                _database_query_execution_preparer=prepare_database_query_execution,
+                _database_query_execution_completer=complete_database_query_execution,
             )
             output = await self._run_worker_with_heartbeat(slot, job, context)
+            pending_interrupt = self._poll_operator_interrupt(slot, job)
+            if pending_interrupt is not None:
+                raise pending_interrupt
             handoff = _validate_and_bind_output(job.role, job.item_id, output)
             _validate_evidence_attachments(
                 handoff, allow_simulated=self.allow_simulated_evidence
             )
             self._finalize_handoff(slot, job, handoff)
+        except OperatorInterruption as interruption:
+            accepted = self.storage.complete_operator_interrupt(
+                request_id=interruption.request_id,
+                job_id=job.id,
+                worker_id=slot.worker_id,
+                lease_token=lease_token,
+                reason=interruption.reason,
+            )
+            if not accepted:
+                self.stale_job_ids.append(job.id)
         except LeaseLost:
             self.stale_job_ids.append(job.id)
         except HeartbeatStorageFailure as error:
@@ -587,13 +677,27 @@ class Scheduler:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            self.storage.fail_job(
+            accepted = self.storage.fail_job(
                 job_id=job.id,
                 worker_id=slot.worker_id,
                 lease_token=lease_token,
                 error=f"{type(error).__name__}: {error}",
                 max_attempts=self.max_attempts,
             )
+            if not accepted:
+                pending_interrupt = self._poll_operator_interrupt(slot, job)
+                if pending_interrupt is None:
+                    self.stale_job_ids.append(job.id)
+                else:
+                    completed = self.storage.complete_operator_interrupt(
+                        request_id=pending_interrupt.request_id,
+                        job_id=job.id,
+                        worker_id=slot.worker_id,
+                        lease_token=lease_token,
+                        reason=pending_interrupt.reason,
+                    )
+                    if not completed:
+                        self.stale_job_ids.append(job.id)
 
     def _record_external_session(
         self,
@@ -720,6 +824,72 @@ class Scheduler:
             )
         return completed
 
+    def _prepare_browser_evidence_execution(
+        self, slot: _WorkerSlot, job: Job
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        prepared = self.storage.prepare_browser_evidence_execution(
+            job.id, slot.worker_id, lease_token
+        )
+        if prepared is None:
+            raise LeaseLost(
+                "browser-evidence preparation rejected the stale lease fence"
+            )
+        return prepared
+
+    def _complete_browser_evidence_execution(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        result: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        completed = self.storage.complete_browser_evidence_execution(
+            job.id, slot.worker_id, lease_token, result
+        )
+        if completed is None:
+            raise LeaseLost(
+                "browser-evidence completion rejected the stale lease fence"
+            )
+        return completed
+
+    def _prepare_database_query_execution(
+        self, slot: _WorkerSlot, job: Job
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        prepared = self.storage.prepare_database_query_execution(
+            job.id, slot.worker_id, lease_token
+        )
+        if prepared is None:
+            raise LeaseLost(
+                "database-evidence preparation rejected the stale lease fence"
+            )
+        return prepared
+
+    def _complete_database_query_execution(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        result: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        completed = self.storage.complete_database_query_execution(
+            job.id, slot.worker_id, lease_token, result
+        )
+        if completed is None:
+            raise LeaseLost(
+                "database-evidence completion rejected the stale lease fence"
+            )
+        return completed
+
     async def _run_worker_with_heartbeat(
         self,
         slot: _WorkerSlot,
@@ -737,7 +907,18 @@ class Scheduler:
             # A rejected/erroring heartbeat takes precedence even when the
             # worker happens to finish during the same event-loop turn.
             if heartbeat_task in done:
-                heartbeat_task.result()
+                try:
+                    heartbeat_task.result()
+                except OperatorInterruption:
+                    heartbeat_task = asyncio.create_task(
+                        self._heartbeat(
+                            slot, job, poll_operator_interrupt=False
+                        )
+                    )
+                    if not worker_task.done():
+                        worker_task.cancel()
+                    await asyncio.gather(worker_task, return_exceptions=True)
+                    raise
             return worker_task.result()
         finally:
             for task in (worker_task, heartbeat_task):
@@ -745,7 +926,13 @@ class Scheduler:
                     task.cancel()
             await asyncio.gather(worker_task, heartbeat_task, return_exceptions=True)
 
-    async def _heartbeat(self, slot: _WorkerSlot, job: Job) -> None:
+    async def _heartbeat(
+        self,
+        slot: _WorkerSlot,
+        job: Job,
+        *,
+        poll_operator_interrupt: bool = True,
+    ) -> None:
         lease_token = job.lease_token
         if lease_token is None:
             raise LeaseLost("claimed job has no lease token")
@@ -772,6 +959,32 @@ class Scheduler:
                     )
             if not accepted:
                 raise LeaseLost("heartbeat rejected the stale lease fence")
+            if poll_operator_interrupt:
+                interrupt = self._poll_operator_interrupt(slot, job)
+                if interrupt is not None:
+                    raise interrupt
+
+    def _poll_operator_interrupt(
+        self, slot: _WorkerSlot, job: Job
+    ) -> Optional[OperatorInterruption]:
+        lease_token = job.lease_token
+        if lease_token is None:
+            raise LeaseLost("claimed job has no lease token")
+        poll_interrupt = getattr(self.storage, "poll_operator_interrupt", None)
+        interrupt = (
+            None
+            if poll_interrupt is None
+            else poll_interrupt(job.id, slot.worker_id, lease_token)
+        )
+        if interrupt is None:
+            return None
+        request_id = interrupt.get("id")
+        reason = interrupt.get("reason")
+        if not isinstance(request_id, str) or not isinstance(reason, str):
+            raise HeartbeatStorageFailure(
+                "operator interrupt storage returned an invalid request"
+            )
+        return OperatorInterruption(request_id, reason)
 
     def _finalize_handoff(self, slot: _WorkerSlot, job: Job, handoff: BaseModel) -> None:
         lease_token = job.lease_token
@@ -838,6 +1051,9 @@ class Scheduler:
             next_job_payload=next_payload,
         )
         if not accepted:
+            pending_interrupt = self._poll_operator_interrupt(slot, job)
+            if pending_interrupt is not None:
+                raise pending_interrupt
             raise LeaseLost("stage finalization rejected the stale lease fence")
 
 

@@ -42,6 +42,18 @@ class WorkerContext:
     _focused_test_execution_completer: Optional[
         Callable[[Mapping[str, Any]], Mapping[str, Any]]
     ] = field(default=None, repr=False, compare=False)
+    _browser_evidence_execution_preparer: Optional[
+        Callable[[], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _browser_evidence_execution_completer: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _database_query_execution_preparer: Optional[
+        Callable[[], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
+    _database_query_execution_completer: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    ] = field(default=None, repr=False, compare=False)
 
     @property
     def item_id(self) -> str:
@@ -145,6 +157,66 @@ class WorkerContext:
         if not isinstance(completed, Mapping):
             raise WorkerExecutionError(
                 "focused-test completion returned an invalid canonical result"
+            )
+        return completed
+
+    def prepare_browser_evidence_execution(self) -> Mapping[str, Any]:
+        """Request the fixed visible-browser contract for this attempt."""
+
+        if self._browser_evidence_execution_preparer is None:
+            raise WorkerExecutionError(
+                "this worker context has no browser-evidence authority"
+            )
+        prepared = self._browser_evidence_execution_preparer()
+        if not isinstance(prepared, Mapping):
+            raise WorkerExecutionError(
+                "browser-evidence preparation returned an invalid contract"
+            )
+        return prepared
+
+    def complete_browser_evidence_execution(
+        self, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Submit a fixed browser result through the current attempt fence."""
+
+        if self._browser_evidence_execution_completer is None:
+            raise WorkerExecutionError(
+                "this worker context has no browser-evidence completion authority"
+            )
+        completed = self._browser_evidence_execution_completer(result)
+        if not isinstance(completed, Mapping):
+            raise WorkerExecutionError(
+                "browser-evidence completion returned an invalid result"
+            )
+        return completed
+
+    def prepare_database_query_execution(self) -> Mapping[str, Any]:
+        """Request the fixed read-only database contract for this attempt."""
+
+        if self._database_query_execution_preparer is None:
+            raise WorkerExecutionError(
+                "this worker context has no database-evidence authority"
+            )
+        prepared = self._database_query_execution_preparer()
+        if not isinstance(prepared, Mapping):
+            raise WorkerExecutionError(
+                "database-evidence preparation returned an invalid contract"
+            )
+        return prepared
+
+    def complete_database_query_execution(
+        self, result: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Submit a fixed database result through the current attempt fence."""
+
+        if self._database_query_execution_completer is None:
+            raise WorkerExecutionError(
+                "this worker context has no database-evidence completion authority"
+            )
+        completed = self._database_query_execution_completer(result)
+        if not isinstance(completed, Mapping):
+            raise WorkerExecutionError(
+                "database-evidence completion returned an invalid result"
             )
         return completed
 

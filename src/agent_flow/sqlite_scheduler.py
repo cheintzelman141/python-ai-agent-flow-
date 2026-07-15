@@ -259,6 +259,37 @@ class SQLiteSchedulerStorage:
             return False
         return True
 
+    def poll_operator_interrupt(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.poll_operator_interrupt(
+                job_id, worker_id, lease_token
+            )
+        except LeaseConflict:
+            return None
+
+    def complete_operator_interrupt(
+        self,
+        *,
+        request_id: str,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        reason: str,
+    ) -> bool:
+        try:
+            self.store.interrupt_job(
+                job_id,
+                worker_id,
+                lease_token,
+                reason=reason,
+                operator_request_id=request_id,
+            )
+        except LeaseConflict:
+            return False
+        return True
+
     def record_external_session(
         self,
         job_id: str,
@@ -376,6 +407,66 @@ class SQLiteSchedulerStorage:
                 worker_id,
                 lease_token,
                 dict(result),
+            )
+        except LeaseConflict:
+            return None
+
+    def prepare_browser_evidence_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            job = self.store.get_job(job_id)
+            plans = self.store.list_browser_evidence_plans(
+                work_item_id=str(job["work_item_id"])
+            )
+            if not plans:
+                return None
+            return self.store.prepare_browser_evidence_execution(
+                str(plans[-1]["id"]), job_id, worker_id, lease_token
+            )
+        except LeaseConflict:
+            return None
+
+    def complete_browser_evidence_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.complete_browser_evidence_execution(
+                job_id, worker_id, lease_token, dict(result)
+            )
+        except LeaseConflict:
+            return None
+
+    def prepare_database_query_execution(
+        self, job_id: str, worker_id: str, lease_token: str
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            job = self.store.get_job(job_id)
+            plans = self.store.list_database_query_plans(
+                work_item_id=str(job["work_item_id"])
+            )
+            if not plans:
+                return None
+            return self.store.prepare_database_query_execution(
+                str(plans[-1]["id"]), job_id, worker_id, lease_token
+            )
+        except LeaseConflict:
+            return None
+
+    def complete_database_query_execution(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        result: Mapping[str, Any],
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.complete_database_query_execution(
+                job_id, worker_id, lease_token, dict(result)
             )
         except LeaseConflict:
             return None

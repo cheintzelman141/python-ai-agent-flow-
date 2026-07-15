@@ -10,7 +10,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, Iterable, Literal, Optional, Tuple
+import math
+from pathlib import Path
+import re
+from typing import Any, Dict, Iterable, Literal, Mapping, Optional, Tuple, Union
+import unicodedata
 from uuid import uuid4
 
 from pydantic import (
@@ -26,6 +30,23 @@ from typing_extensions import Annotated
 
 
 NonEmptyString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+ResourceIdentifier = Annotated[
+    str,
+    StringConstraints(pattern=r"^res_[0-9a-f]{32}$"),
+]
+ResourceName = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.:-]*$",
+    ),
+]
+EnvironmentKey = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Z][A-Z0-9_]{0,127}$"),
+]
 
 
 def utc_now() -> datetime:
@@ -85,6 +106,18 @@ class WorkspaceKind(str, Enum):
     SOURCE_READ_ONLY = "source_read_only"
     MANAGED_WORKTREE = "managed_worktree"
     SIMULATED = "simulated"
+
+
+class ResourceKind(str, Enum):
+    CHROME_PROFILE = "chrome_profile"
+    TENANT_DATABASE = "tenant_database"
+    QUEUE_ENVIRONMENT = "queue_environment"
+    TEST_FIXTURE = "test_fixture"
+
+
+class ResourcePolicyMode(str, Enum):
+    EXCLUSIVE = "exclusive"
+    SHARED = "shared"
 
 
 class ManagedWorktreeState(str, Enum):
@@ -357,6 +390,263 @@ class ResourceLease(DomainModel):
     acquired_at: AwareDatetime = Field(default_factory=utc_now)
     heartbeat_at: AwareDatetime = Field(default_factory=utc_now)
     lease_expires_at: AwareDatetime
+
+
+_SENSITIVE_RESOURCE_FIELDS = frozenset(
+    {
+        "api_key",
+        "client_secret",
+        "connection_string",
+        "cookie",
+        "cookies",
+        "dsn",
+        "password",
+        "passwd",
+        "secret",
+        "token",
+    }
+)
+_CREDENTIAL_URI_PATTERN = re.compile(
+    r"[A-Za-z][A-Za-z0-9+.-]*://[^/\s]+@"
+)
+_CREDENTIAL_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9])"
+    r"(?:api[_-]?key|client[_-]?secret|cookie|password|passwd|secret|token)"
+    r"\s*(?:=|:)\s*\S"
+)
+
+
+def _is_sensitive_resource_field(value: Any) -> bool:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value).strip().lower())
+    collapsed = normalized.replace("_", "")
+    components = {component for component in normalized.split("_") if component}
+    if normalized in _SENSITIVE_RESOURCE_FIELDS or components.intersection(
+        {"cookie", "cookies", "password", "passwd", "secret", "token"}
+    ):
+        return True
+    return any(
+        marker in collapsed
+        for marker in (
+            "apikey",
+            "clientsecret",
+            "cookie",
+            "password",
+            "passwd",
+            "secret",
+            "token",
+        )
+    )
+
+
+def _reject_resource_secrets(value: Any, path: str) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if _is_sensitive_resource_field(key):
+                raise ValueError("%s contains a prohibited sensitive field" % path)
+            _reject_resource_secrets(nested, "%s field" % path)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_resource_secrets(nested, "%s[%d]" % (path, index))
+        return
+    if isinstance(value, str):
+        if _CREDENTIAL_URI_PATTERN.search(value.strip()):
+            raise ValueError("%s contains a credential-bearing URI" % path)
+        if _CREDENTIAL_ASSIGNMENT_PATTERN.search(value):
+            raise ValueError("%s contains an obvious credential assignment" % path)
+
+
+def _reject_control_or_format_characters(value: Any, path: str) -> None:
+    if isinstance(value, Mapping):
+        for nested in value.values():
+            _reject_control_or_format_characters(
+                nested, "%s field" % path
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for index, nested in enumerate(value):
+            _reject_control_or_format_characters(
+                nested, "%s[%d]" % (path, index)
+            )
+        return
+    if isinstance(value, str) and any(
+        unicodedata.category(character) in {"Cc", "Cf"}
+        for character in value
+    ):
+        raise ValueError("%s contains prohibited control or format characters" % path)
+
+
+class ResourceConcurrencyPolicy(DomainModel):
+    mode: ResourcePolicyMode = ResourcePolicyMode.EXCLUSIVE
+    limit: int = Field(default=1, ge=1, le=128, strict=True)
+
+    @model_validator(mode="after")
+    def validate_limit(self) -> "ResourceConcurrencyPolicy":
+        if self.mode == ResourcePolicyMode.EXCLUSIVE and self.limit != 1:
+            raise ValueError("exclusive resources must have a concurrency limit of 1")
+        if self.mode == ResourcePolicyMode.SHARED and self.limit < 2:
+            raise ValueError("shared resources must have a concurrency limit of at least 2")
+        return self
+
+
+class ChromeProfileResourceConfig(DomainModel):
+    user_data_dir: NonEmptyString
+    profile_directory: Annotated[
+        str,
+        StringConstraints(min_length=1, max_length=128),
+    ]
+
+    @field_validator("user_data_dir")
+    @classmethod
+    def validate_user_data_dir(cls, value: str) -> str:
+        supplied = Path(value).expanduser()
+        if not supplied.is_absolute():
+            raise ValueError("Chrome user_data_dir must be an absolute path")
+        return str(supplied.resolve())
+
+    @field_validator("profile_directory", mode="before")
+    @classmethod
+    def validate_profile_directory(cls, value: str) -> str:
+        if not isinstance(value, str):
+            raise ValueError("Chrome profile_directory must be a string")
+        if value != value.strip():
+            raise ValueError(
+                "Chrome profile_directory must not have surrounding whitespace"
+            )
+        _reject_control_or_format_characters(value, "profile_directory")
+        if value in {".", ".."} or "/" in value or "\\" in value:
+            raise ValueError(
+                "Chrome profile_directory must be one directory name "
+                "without traversal or separators"
+            )
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_. -]{0,127}", value) is None:
+            raise ValueError("Chrome profile_directory contains unsupported characters")
+        return value
+
+
+class TenantDatabaseResourceConfig(DomainModel):
+    tenant_key: ResourceName
+    database_name: ResourceName
+    connection_env: EnvironmentKey
+
+
+class QueueEnvironmentResourceConfig(DomainModel):
+    environment_key: ResourceName
+    queue_names: Tuple[ResourceName, ...] = Field(min_length=1, max_length=64)
+    connection_env: Optional[EnvironmentKey] = None
+
+    @field_validator("queue_names")
+    @classmethod
+    def validate_queue_names(
+        cls, value: Tuple[str, ...]
+    ) -> Tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("queue_names must be unique")
+        return value
+
+
+class TestFixtureResourceConfig(DomainModel):
+    fixture_key: ResourceName
+    root_path: NonEmptyString
+    disposable: Literal[True] = True
+
+    @field_validator("root_path")
+    @classmethod
+    def validate_root_path(cls, value: str) -> str:
+        supplied = Path(value).expanduser()
+        if not supplied.is_absolute():
+            raise ValueError("test fixture root_path must be an absolute path")
+        normalized = str(supplied.resolve())
+        if not normalized.startswith("/private/tmp/agent-flow-"):
+            raise ValueError(
+                "test fixture root_path must be under /private/tmp/agent-flow-*"
+            )
+        return normalized
+
+
+ResourceConfiguration = Union[
+    ChromeProfileResourceConfig,
+    TenantDatabaseResourceConfig,
+    QueueEnvironmentResourceConfig,
+    TestFixtureResourceConfig,
+]
+ResourceMetadataValue = Union[str, int, float, bool]
+
+
+class ResourceDefinitionSpec(DomainModel):
+    kind: ResourceKind
+    label: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=160),
+    ]
+    enabled: bool = True
+    configuration: ResourceConfiguration
+    campaign_id: Optional[NonEmptyString] = None
+    metadata: Dict[str, ResourceMetadataValue] = Field(default_factory=dict)
+    policy: ResourceConcurrencyPolicy = Field(
+        default_factory=ResourceConcurrencyPolicy
+    )
+
+    @field_validator("configuration", mode="before")
+    @classmethod
+    def reject_configuration_secrets(cls, value: Any) -> Any:
+        _reject_resource_secrets(value, "configuration")
+        return value
+
+    @field_validator("metadata", mode="before")
+    @classmethod
+    def validate_metadata(cls, value: Any) -> Any:
+        _reject_resource_secrets(value, "metadata")
+        _reject_control_or_format_characters(value, "metadata")
+        if not isinstance(value, Mapping):
+            raise ValueError("metadata must be an object")
+        if len(value) > 32:
+            raise ValueError("metadata may contain at most 32 display fields")
+        for key in value:
+            if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", str(key)):
+                raise ValueError("metadata keys must be safe display identifiers")
+        if any(
+            isinstance(entry, float) and not math.isfinite(entry)
+            for entry in value.values()
+        ):
+            raise ValueError("metadata numbers must be finite")
+        return value
+
+    @field_validator("label", mode="before")
+    @classmethod
+    def reject_label_credentials(cls, value: str) -> str:
+        _reject_resource_secrets(value, "label")
+        _reject_control_or_format_characters(value, "label")
+        return value
+
+    @model_validator(mode="after")
+    def validate_kind_configuration(self) -> "ResourceDefinitionSpec":
+        expected_type = {
+            ResourceKind.CHROME_PROFILE: ChromeProfileResourceConfig,
+            ResourceKind.TENANT_DATABASE: TenantDatabaseResourceConfig,
+            ResourceKind.QUEUE_ENVIRONMENT: QueueEnvironmentResourceConfig,
+            ResourceKind.TEST_FIXTURE: TestFixtureResourceConfig,
+        }[self.kind]
+        if not isinstance(self.configuration, expected_type):
+            raise ValueError(
+                "%s resources require %s configuration"
+                % (self.kind.value, expected_type.__name__)
+            )
+        return self
+
+
+class ResourceDefinition(ResourceDefinitionSpec):
+    id: ResourceIdentifier
+    identity_hash: Annotated[
+        str,
+        StringConstraints(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    definition_hash: Annotated[
+        str,
+        StringConstraints(pattern=r"^[0-9a-f]{64}$"),
+    ]
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
 
 
 class ManagedWorktree(DomainModel):

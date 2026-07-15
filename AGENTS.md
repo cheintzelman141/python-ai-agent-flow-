@@ -48,7 +48,8 @@ includes:
   UID, kernel birth, and executable registration is durable;
 - untrusted-project execution with ambient hooks, MCP, apps, remote tools,
   network access, extra write roots, and temporary-directory writes disabled;
-- exact external session persistence and exact-ID resume;
+- exact external session persistence plus explicit, one-time exact-ID resume
+  authorization;
 - persisted PID, process-group, UID, kernel birth, guardian executable, and
   target executable identity;
 - bounded JSONL/stderr capture plus hashed attempt artifacts outside target
@@ -78,18 +79,38 @@ includes:
 - a compact `watch` terminal monitor backed by strict read-only SQLite opens,
   transactionally consistent snapshots with exact aggregate totals, bounded
   item detail and recent events, alert-prioritized per-item lanes, clean
-  interruption, and no workflow-control authority.
+  interruption, and no workflow-control authority; and
+- schema-v9 durable resource definitions for exact visible Chrome profiles,
+  tenant databases, queue environments, and disposable test fixtures. Typed,
+  secret-rejecting configuration, stable opaque IDs, optional campaign scope,
+  display-safe metadata, enablement state, and exclusive/shared capacity policy
+  remain separate from active fenced leases. Claims fail closed for missing,
+  disabled, malformed, or out-of-scope definitions while skipping blocked jobs;
+  definition and lease lifecycle mutations append durable audit events; and
+- immutable supervisor-owned visible-Chrome and read-only SQLite query plans,
+  attempt/job/resource-fenced execution rows, bounded hashed artifacts, and
+  storage-canonical focused/browser/database gate replacement. Visible Chrome
+  runs only a fixed file-route/title/body/screenshot contract inside a durable
+  blocked process-group guardian. SQLite runs only a comment-free direct
+  `SELECT` with URI read-only mode, `query_only`, a deny-non-read authorizer,
+  row/byte/time bounds, exact expected IDs, and foreign-key proof; and
+- transactional `operator-interrupt` and `operator-resume` controls. Interrupt
+  requests bind the current lease, attempt, process birth identity, session,
+  worktree generation, and resource set; resume authorization is explicit,
+  one-time, same-job, and exact-session. Sequential collector processes retain
+  immutable history while only one process may be active per attempt.
 
-This slice does not yet provide durable browser/database evidence collectors or
-general real-repository campaign execution. The current evidence attachment
-gate remains non-authoritative for arbitrary test, browser, or database
-commands. The focused collector is authoritative only for the exact trusted
-fixture whose bytes are preflighted by the proof command. It is not an
-authorization boundary for arbitrary repository test code: it does not yet
-deny same-user filesystem access, network access, or detached child processes,
-and its semantic transcript evaluator is not a trusted general test harness.
-Keep general real campaigns disabled until an OS sandbox or trusted harness and
-the other evidence collectors exist and are proven against disposable fixtures.
+This slice still does not provide general real-repository campaign execution.
+The three collectors are authoritative only for their supervisor-prepared,
+disposable fixed contracts; arbitrary worker-supplied commands, routes, browser
+actions, SQL, credentials, and target paths remain unauthorized. The focused
+collector is not an authorization boundary for arbitrary repository test code:
+it does not deny same-user filesystem access, network access, or detached child
+processes, and its semantic transcript evaluator is not a trusted general test
+harness. Keep general real campaigns disabled until an OS sandbox or a narrower
+trusted harness proves those controls. Resource registration alone still does
+not authorize launching Chrome, reading an existing browser profile, connecting
+to an application database, starting queues/workers, or mutating a target.
 
 ## Architecture Rules
 
@@ -105,6 +126,12 @@ the other evidence collectors exist and are proven against disposable fixtures.
 - Every claim uses an opaque fencing token. Heartbeats and finalization must
   match the current job, owner, and token so expired workers cannot submit
   stale output after recovery.
+- Registered resource identity uses its exact opaque definition ID. Labels are
+  display-only and must never select a mutation target. Definition records and
+  active lease fences remain separate; do not create a second lease system.
+- Persist credential references or environment-key names only. Never store
+  passwords, tokens, cookies, credential-bearing DSNs, or browser session
+  contents in definitions, metadata, events, or status output.
 - Keep durable work items, logical stage jobs, and immutable execution attempts
   separate. Retries never overwrite attempt history.
 - Stage finalization must atomically store the handoff, finish the attempt/job,
@@ -122,7 +149,8 @@ the other evidence collectors exist and are proven against disposable fixtures.
 
 ## Shared Module Boundaries
 
-- `models.py`: enums, records, handoff schemas, and deterministic gate checks.
+- `models.py`: enums, typed resource definitions, records, handoff schemas, and
+  deterministic gate checks.
 - `storage.py`: SQLite schema, transactions, persistence, claims, events, and
   leases. It must not run workers.
 - `scheduler.py`: worker-pool scheduling and workflow transitions. It must use
