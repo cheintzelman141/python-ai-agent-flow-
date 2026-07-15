@@ -37,7 +37,7 @@ from agent_flow.models import (
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 OPEN_JOB_STATUSES = ("pending", "running")
 DEFAULT_REQUIRED_GATES = ("focused_tests", "browser", "database")
 DEFAULT_ROLE_LIMITS = {"investigator": 2, "fixer": 2, "tester": 2}
@@ -192,20 +192,52 @@ class SQLiteStore:
         *,
         timeout: float = 5.0,
         clock: Callable[[], float] = time.time,
+        read_only: bool = False,
     ) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not isinstance(read_only, bool):
+            raise ValueError("read_only must be a boolean")
+        self.path = Path(path).expanduser().resolve()
+        self.read_only = read_only
+        if not read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
         self._clock = clock
         self._lock = threading.RLock()
+        database = str(self.path)
+        uri = False
+        if read_only:
+            if not self.path.is_file():
+                raise StorageError("Agent Flow database does not exist: %s" % self.path)
+            database = self.path.as_uri() + "?mode=ro"
+            uri = True
         self._connection = sqlite3.connect(
-            str(self.path), timeout=timeout, isolation_level=None, check_same_thread=False
+            database,
+            timeout=timeout,
+            isolation_level=None,
+            check_same_thread=False,
+            uri=uri,
         )
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA busy_timeout = %d" % int(timeout * 1000))
-        self._connection.execute("PRAGMA journal_mode = WAL")
-        self._connection.execute("PRAGMA synchronous = FULL")
-        self._migrate()
+        if read_only:
+            try:
+                self._connection.execute("PRAGMA query_only = ON")
+                version = int(
+                    self._connection.execute("PRAGMA user_version").fetchone()[0]
+                )
+                if version != SCHEMA_VERSION:
+                    raise StorageError(
+                        "database schema version %d is not supported by this read-only "
+                        "command; run `agent-flow init` with this database using version %d"
+                        % (version, SCHEMA_VERSION)
+                    )
+            except BaseException:
+                self._connection.close()
+                raise
+        else:
+            self._connection.execute("PRAGMA journal_mode = WAL")
+            self._connection.execute("PRAGMA synchronous = FULL")
+            self._migrate()
 
     def close(self) -> None:
         with self._lock:
@@ -219,6 +251,8 @@ class SQLiteStore:
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
+        if self.read_only:
+            raise StorageError("write transactions are disabled for this read-only store")
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
             try:
@@ -228,6 +262,17 @@ class SQLiteStore:
                 raise
             else:
                 self._connection.commit()
+
+    @contextmanager
+    def _read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Hold one short, non-blocking WAL snapshot across related reads."""
+
+        with self._lock:
+            self._connection.execute("BEGIN")
+            try:
+                yield self._connection
+            finally:
+                self._connection.rollback()
 
     def _migrate(self) -> None:
         with self._transaction() as connection:
@@ -267,6 +312,11 @@ class SQLiteStore:
                 for statement in _SCHEMA_V6:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version = 6")
+                version = 6
+            if version == 6:
+                for statement in _SCHEMA_V7:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 7")
 
     @staticmethod
     def _migrate_workspace_kinds(connection: sqlite3.Connection) -> None:
@@ -415,6 +465,315 @@ class SQLiteStore:
         if row is None:
             raise NotFoundError("campaign %s not found" % campaign_id)
         return self._row(row)  # type: ignore[return-value]
+
+    def read_campaign_status_snapshot(
+        self, campaign_id: str, *, event_limit: int = 8
+    ) -> Dict[str, Any]:
+        """Return one transactionally consistent snapshot with bounded events."""
+
+        if (
+            not isinstance(event_limit, int)
+            or isinstance(event_limit, bool)
+            or event_limit < 0
+        ):
+            raise ValueError("event_limit must be a non-negative integer")
+        with self._read_transaction():
+            captured_at = self._clock()
+            campaign = self.get_campaign(campaign_id)
+            worktrees = self.list_managed_worktrees(campaign_id=campaign_id)
+            return {
+                "captured_at": captured_at,
+                "campaign": campaign,
+                "items": self.list_work_items(campaign_id),
+                "jobs": self.list_jobs(campaign_id=campaign_id),
+                "attempts": self.list_attempts(campaign_id=campaign_id),
+                "resource_leases": self.list_resource_leases(
+                    campaign_id=campaign_id
+                ),
+                "events": self.list_events(
+                    campaign_id=campaign_id, limit=event_limit
+                ),
+                "managed_worktrees": worktrees,
+                "worktree_operations": self.list_worktree_operations(
+                    campaign_id=campaign_id
+                ),
+            }
+
+    def read_campaign_watch_snapshot(
+        self,
+        campaign_id: str,
+        *,
+        event_limit: int = 8,
+        item_limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Return exact totals plus bounded detail for the live monitor.
+
+        A live refresh must have work proportional to its configured detail
+        ceiling, not to the lifetime size of a campaign.  Aggregate counts are
+        still exact and every returned record comes from one SQLite snapshot.
+        """
+
+        if (
+            not isinstance(event_limit, int)
+            or isinstance(event_limit, bool)
+            or event_limit < 0
+        ):
+            raise ValueError("event_limit must be a non-negative integer")
+        if (
+            not isinstance(item_limit, int)
+            or isinstance(item_limit, bool)
+            or item_limit < 1
+            or item_limit > 200
+        ):
+            raise ValueError("item_limit must be an integer from 1 to 200")
+
+        with self._read_transaction():
+            captured_at = self._clock()
+            campaign = self.get_campaign(campaign_id)
+            count_rows = self._connection.execute(
+                """SELECT state, COUNT(*) AS item_count
+                   FROM work_items WHERE campaign_id = ? GROUP BY state""",
+                (campaign_id,),
+            ).fetchall()
+            item_state_counts = {
+                str(row["state"]): int(row["item_count"]) for row in count_rows
+            }
+            total_items = sum(item_state_counts.values())
+            item_facts = """SELECT i.*,
+                    (SELECT COUNT(*) FROM jobs open_job
+                     WHERE open_job.work_item_id = i.id
+                       AND open_job.status IN ('pending', 'leased', 'running'))
+                        AS open_job_count,
+                    (SELECT COUNT(*) FROM jobs expired_job
+                     WHERE expired_job.work_item_id = i.id
+                       AND expired_job.status IN ('leased', 'running')
+                       AND expired_job.lease_expires_at IS NOT NULL
+                       AND expired_job.lease_expires_at <= ?)
+                        AS expired_job_count,
+                    (SELECT COUNT(*) FROM jobs process_job
+                     JOIN attempts process_attempt
+                       ON process_attempt.job_id = process_job.id
+                     JOIN external_processes process
+                       ON process.attempt_id = process_attempt.id
+                     WHERE process_job.work_item_id = i.id
+                       AND process.state IN ('quarantined',
+                                             'legacy_unverifiable'))
+                        AS process_alert_count,
+                    EXISTS (
+                        SELECT 1 FROM managed_worktrees quarantined_worktree
+                        WHERE quarantined_worktree.work_item_id = i.id
+                          AND quarantined_worktree.state = 'quarantined')
+                        AS worktree_alert_count,
+                    EXISTS (
+                        SELECT 1 FROM managed_worktrees operation_worktree
+                        JOIN worktree_operations operation
+                          ON operation.managed_worktree_id = operation_worktree.id
+                        WHERE operation_worktree.work_item_id = i.id
+                          AND operation.status = 'quarantined'
+                          AND operation.operation_number = (
+                              SELECT MAX(latest_operation.operation_number)
+                              FROM worktree_operations latest_operation
+                              WHERE latest_operation.managed_worktree_id =
+                                    operation.managed_worktree_id))
+                        AS operation_alert_count
+                FROM work_items i WHERE i.campaign_id = ?"""
+            ranked_items = """SELECT facts.*,
+                    CASE
+                        WHEN process_alert_count > 0
+                             OR worktree_alert_count > 0
+                             OR operation_alert_count > 0 THEN 0
+                        WHEN expired_job_count > 0 THEN 1
+                        WHEN open_job_count > 1 THEN 2
+                        WHEN state = 'blocked' THEN 3
+                        ELSE 4
+                    END AS hazard_rank
+                FROM (%s) facts""" % item_facts
+            alert_item_count = int(
+                self._connection.execute(
+                    "SELECT COUNT(*) FROM (%s) ranked WHERE hazard_rank < 4"
+                    % ranked_items,
+                    (captured_at, campaign_id),
+                ).fetchone()[0]
+            )
+            item_rows = self._connection.execute(
+                """SELECT * FROM (%s) ranked
+                   ORDER BY hazard_rank, priority DESC, created_at, id LIMIT ?"""
+                % ranked_items,
+                (captured_at, campaign_id, item_limit),
+            ).fetchall()
+            items = self._rows(item_rows)
+            item_ids = [str(row["id"]) for row in item_rows]
+
+            jobs: List[Dict[str, Any]] = []
+            attempts: List[Dict[str, Any]] = []
+            resource_leases: List[Dict[str, Any]] = []
+            worktrees: List[Dict[str, Any]] = []
+            operations: List[Dict[str, Any]] = []
+            if item_ids:
+                item_placeholders = ",".join("?" for _ in item_ids)
+                job_rows = self._connection.execute(
+                    """SELECT j.* FROM jobs j
+                       WHERE j.work_item_id IN (%s)
+                         AND j.id = (
+                             SELECT lane_job.id FROM jobs lane_job
+                             WHERE lane_job.work_item_id = j.work_item_id
+                             ORDER BY
+                                 CASE
+                                     WHEN lane_job.status IN ('leased', 'running')
+                                          AND lane_job.lease_expires_at IS NOT NULL
+                                          AND lane_job.lease_expires_at <= ? THEN 0
+                                     WHEN lane_job.status IN (
+                                         'pending', 'leased', 'running') THEN 1
+                                     ELSE 2
+                                 END,
+                                 lane_job.updated_at DESC,
+                                 lane_job.created_at DESC,
+                                 lane_job.id DESC
+                             LIMIT 1)
+                       ORDER BY j.priority DESC, j.created_at, j.id"""
+                    % item_placeholders,
+                    item_ids + [captured_at],
+                ).fetchall()
+                jobs = self._rows(job_rows)
+                job_ids = [str(row["id"]) for row in job_rows]
+                if job_ids:
+                    job_placeholders = ",".join("?" for _ in job_ids)
+                    attempt_rows = self._connection.execute(
+                        """SELECT a.*,
+                                  ep.provider AS external_process_provider,
+                                  ep.state AS external_process_state,
+                                  ep.identity_version
+                                      AS external_process_identity_version,
+                                  ep.owner_uid AS external_process_owner_uid,
+                                  ep.start_seconds
+                                      AS external_process_start_seconds,
+                                  ep.start_microseconds
+                                      AS external_process_start_microseconds,
+                                  ep.target_executable
+                                      AS external_process_target_executable,
+                                  ep.outcome AS external_process_outcome,
+                                  ep.last_error AS external_process_last_error,
+                                  ep.stopped_at AS external_process_stopped_at
+                           FROM attempts a
+                           JOIN jobs attempt_job ON attempt_job.id = a.job_id
+                           LEFT JOIN external_processes ep
+                             ON ep.attempt_id = a.id
+                           WHERE (a.job_id IN (%s)
+                                  AND a.attempt_number = (
+                                      SELECT MAX(a2.attempt_number)
+                                      FROM attempts a2
+                                      WHERE a2.job_id = a.job_id))
+                              OR (attempt_job.work_item_id IN (%s)
+                                  AND ep.state IN ('quarantined',
+                                                   'legacy_unverifiable')
+                                  AND a.id = (
+                                      SELECT critical_attempt.id
+                                      FROM jobs critical_job
+                                      JOIN attempts critical_attempt
+                                        ON critical_attempt.job_id =
+                                           critical_job.id
+                                      JOIN external_processes critical_process
+                                        ON critical_process.attempt_id =
+                                           critical_attempt.id
+                                      WHERE critical_job.work_item_id =
+                                            attempt_job.work_item_id
+                                        AND critical_process.state IN (
+                                            'quarantined',
+                                            'legacy_unverifiable')
+                                      ORDER BY critical_process.recorded_at DESC,
+                                               critical_attempt.attempt_number DESC,
+                                               critical_attempt.id DESC
+                                      LIMIT 1))
+                           ORDER BY a.started_at, a.attempt_number"""
+                        % (job_placeholders, item_placeholders),
+                        job_ids + item_ids,
+                    ).fetchall()
+                    attempts = self._rows(attempt_rows)
+                    lease_rows = self._connection.execute(
+                        """SELECT r.* FROM resource_leases r
+                           WHERE r.job_id IN (%s) ORDER BY r.resource_key"""
+                        % job_placeholders,
+                        job_ids,
+                    ).fetchall()
+                    resource_leases = self._rows(lease_rows)
+
+                worktree_rows = self._connection.execute(
+                    """SELECT w.* FROM managed_worktrees w
+                       WHERE w.work_item_id IN (%s)
+                       ORDER BY w.created_at, w.id""" % item_placeholders,
+                    item_ids,
+                ).fetchall()
+                worktrees = self._rows(worktree_rows)
+                worktree_ids = [str(row["id"]) for row in worktree_rows]
+                if worktree_ids:
+                    worktree_placeholders = ",".join("?" for _ in worktree_ids)
+                    operation_rows = self._connection.execute(
+                        """SELECT o.* FROM worktree_operations o
+                           WHERE o.managed_worktree_id IN (%s)
+                             AND o.operation_number = (
+                                 SELECT MAX(o2.operation_number)
+                                 FROM worktree_operations o2
+                                 WHERE o2.managed_worktree_id =
+                                       o.managed_worktree_id)
+                           ORDER BY o.started_at, o.operation_number"""
+                        % worktree_placeholders,
+                        worktree_ids,
+                    ).fetchall()
+                    operations = self._rows(operation_rows)
+
+            worker_rows = self._connection.execute(
+                """SELECT role,
+                          SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END)
+                              AS queued_count,
+                          SUM(CASE WHEN status IN ('leased', 'running')
+                                        AND (lease_expires_at IS NULL
+                                             OR lease_expires_at > ?)
+                                   THEN 1 ELSE 0 END) AS active_count,
+                          SUM(CASE WHEN status IN ('leased', 'running')
+                                        AND lease_expires_at IS NOT NULL
+                                        AND lease_expires_at <= ?
+                                   THEN 1 ELSE 0 END) AS expired_count
+                   FROM jobs WHERE campaign_id = ? GROUP BY role""",
+                (captured_at, captured_at, campaign_id),
+            ).fetchall()
+            worker_counts = {
+                str(row["role"]): {
+                    "queued": int(row["queued_count"] or 0),
+                    "active": int(row["active_count"] or 0),
+                    "expired": int(row["expired_count"] or 0),
+                }
+                for row in worker_rows
+            }
+            return {
+                "captured_at": captured_at,
+                "campaign": campaign,
+                "items": items,
+                "jobs": jobs,
+                "attempts": attempts,
+                "resource_leases": resource_leases,
+                "events": self.list_events(
+                    campaign_id=campaign_id, limit=event_limit
+                ),
+                "managed_worktrees": worktrees,
+                "worktree_operations": operations,
+                "item_state_counts": item_state_counts,
+                "worker_counts": worker_counts,
+                "total_items": total_items,
+                "omitted_item_count": total_items - len(items),
+                "omitted_alert_item_count": max(
+                    0,
+                    alert_item_count
+                    - sum(
+                        1
+                        for item in items
+                        if int(item.get("hazard_rank", 4)) < 4
+                    ),
+                ),
+                "omitted_open_job_count": sum(
+                    max(0, int(item.get("open_job_count", 0)) - 1)
+                    for item in items
+                ),
+            }
 
     def list_campaigns(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -1723,14 +2082,26 @@ class SQLiteStore:
             return self._rows(self._connection.execute(sql, parameters).fetchall())
 
     def list_worktree_operations(
-        self, *, managed_worktree_id: Optional[str] = None
+        self,
+        *,
+        managed_worktree_id: Optional[str] = None,
+        campaign_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM worktree_operations"
-        parameters: Sequence[Any] = ()
+        sql = "SELECT o.* FROM worktree_operations o"
+        clauses: List[str] = []
+        parameters: List[Any] = []
+        if campaign_id is not None:
+            clauses.append(
+                "o.managed_worktree_id IN "
+                "(SELECT id FROM managed_worktrees WHERE campaign_id = ?)"
+            )
+            parameters.append(campaign_id)
         if managed_worktree_id is not None:
-            sql += " WHERE managed_worktree_id = ?"
-            parameters = (managed_worktree_id,)
-        sql += " ORDER BY started_at, operation_number"
+            clauses.append("o.managed_worktree_id = ?")
+            parameters.append(managed_worktree_id)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY o.started_at, o.operation_number"
         with self._lock:
             return self._rows(self._connection.execute(sql, parameters).fetchall())
 
@@ -4863,8 +5234,13 @@ class SQLiteStore:
 
     def list_events(
         self, *, campaign_id: Optional[str] = None, work_item_id: Optional[str] = None,
-        job_id: Optional[str] = None, after_sequence: int = 0
+        job_id: Optional[str] = None, after_sequence: int = 0,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
+        if limit is not None and (
+            not isinstance(limit, int) or isinstance(limit, bool) or limit < 0
+        ):
+            raise ValueError("event limit must be a non-negative integer")
         clauses: List[str] = []
         parameters: List[Any] = []
         for column, value in (
@@ -4880,8 +5256,13 @@ class SQLiteStore:
             parameters.append(after_sequence)
         sql = "SELECT * FROM events" + ((" WHERE " + " AND ".join(clauses)) if clauses else "")
         sql += " ORDER BY sequence"
+        if limit is not None:
+            sql += " DESC LIMIT ?"
+            parameters.append(limit)
         with self._lock:
             rows = self._connection.execute(sql, parameters).fetchall()
+        if limit is not None:
+            rows.reverse()
         return self._rows(rows)
 
     def create_approval(
@@ -5436,4 +5817,22 @@ _SCHEMA_V6 = [
        ON focused_test_executions(work_item_id, prepared_at)""",
     """CREATE INDEX focused_test_execution_job
        ON focused_test_executions(job_id, prepared_at)""",
+]
+
+
+_SCHEMA_V7 = [
+    """CREATE INDEX events_campaign_sequence
+       ON events(campaign_id, sequence)""",
+    """CREATE INDEX work_items_campaign_priority
+       ON work_items(campaign_id, priority DESC, created_at, id)""",
+    """CREATE INDEX work_items_campaign_state
+       ON work_items(campaign_id, state)""",
+    """CREATE INDEX jobs_item_updated
+       ON jobs(work_item_id, updated_at DESC, created_at DESC, id DESC)""",
+    """CREATE INDEX jobs_campaign_role_status_lease
+       ON jobs(campaign_id, role, status, lease_expires_at)""",
+    """CREATE INDEX resource_leases_job
+       ON resource_leases(job_id, resource_key)""",
+    """CREATE INDEX managed_worktrees_campaign
+       ON managed_worktrees(campaign_id, created_at, id)""",
 ]

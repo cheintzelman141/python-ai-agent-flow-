@@ -74,7 +74,11 @@ includes:
 - an opt-in `prove-real-codex --acknowledge-live-model` command that accepts no
   target paths and proves the authenticated investigator -> managed fixer ->
   authoritative same-worktree focused tester boundary against a fixed
-  disposable fixture.
+  disposable fixture; and
+- a compact `watch` terminal monitor backed by strict read-only SQLite opens,
+  transactionally consistent snapshots with exact aggregate totals, bounded
+  item detail and recent events, alert-prioritized per-item lanes, clean
+  interruption, and no workflow-control authority.
 
 This slice does not yet provide durable browser/database evidence collectors or
 general real-repository campaign execution. The current evidence attachment

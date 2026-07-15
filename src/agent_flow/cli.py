@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Mapping, Optional
 
 import typer
 from rich.console import Console
+from rich.live import Live
 from rich.table import Table
 
 from agent_flow.models import (
@@ -24,8 +28,8 @@ from agent_flow.models import (
 from agent_flow.real_proof import run_authenticated_disposable_proof_sync
 from agent_flow.scheduler import Scheduler
 from agent_flow.sqlite_scheduler import LOCAL_WRITE_APPROVAL_ACTION, SQLiteSchedulerStorage
-from agent_flow.status import render_status
-from agent_flow.storage import NotFoundError, SQLiteStore, StorageError
+from agent_flow.status import build_watch_board, render_status
+from agent_flow.storage import SQLiteStore, StorageError
 from agent_flow.worktrees import (
     ManagedWorktreeConfig,
     ManagedWorktreeError,
@@ -52,11 +56,54 @@ def _database_path(database: Optional[Path]) -> Path:
     return (database or default_database_path()).expanduser().resolve()
 
 
-def _open_existing(database: Optional[Path]) -> SQLiteStore:
+def _open_existing(
+    database: Optional[Path], *, read_only: bool = False
+) -> SQLiteStore:
     path = _database_path(database)
     if not path.exists():
         raise typer.BadParameter("Agent Flow database does not exist: %s" % path)
-    return SQLiteStore(path)
+    return SQLiteStore(path, read_only=read_only)
+
+
+def _snapshot_time(snapshot: Mapping[str, Any]) -> datetime:
+    captured_at = snapshot.get("captured_at")
+    if not isinstance(captured_at, (int, float)) or isinstance(captured_at, bool):
+        raise StorageError("campaign status snapshot omitted its capture time")
+    return datetime.fromtimestamp(float(captured_at), tz=timezone.utc)
+
+
+def _watch_renderable(
+    snapshot: Mapping[str, Any],
+    *,
+    event_limit: int,
+    refresh_seconds: float,
+    stale_error: Optional[str] = None,
+) -> object:
+    return build_watch_board(
+        snapshot["campaign"],
+        snapshot["items"],
+        snapshot["jobs"],
+        snapshot["attempts"],
+        snapshot["resource_leases"],
+        snapshot["events"],
+        managed_worktrees=snapshot["managed_worktrees"],
+        worktree_operations=snapshot["worktree_operations"],
+        as_of=_snapshot_time(snapshot),
+        event_limit=event_limit,
+        refresh_seconds=refresh_seconds,
+        stale_error=stale_error,
+        compact=console.width < 110,
+        item_state_counts=snapshot.get("item_state_counts"),
+        worker_counts=snapshot.get("worker_counts"),
+        total_items=snapshot.get("total_items"),
+        omitted_item_count=int(snapshot.get("omitted_item_count", 0)),
+        omitted_alert_item_count=int(
+            snapshot.get("omitted_alert_item_count", 0)
+        ),
+        omitted_open_job_count=int(
+            snapshot.get("omitted_open_job_count", 0)
+        ),
+    )
 
 
 def _worktree_manager(
@@ -202,28 +249,120 @@ def status(
     """Render persisted campaign state without changing it."""
 
     try:
-        with _open_existing(database) as store:
-            campaign = store.get_campaign(campaign_id)
-            worktrees = store.list_managed_worktrees(campaign_id=campaign_id)
-            worktree_ids = {str(worktree["id"]) for worktree in worktrees}
+        with _open_existing(database, read_only=True) as store:
+            snapshot = store.read_campaign_status_snapshot(
+                campaign_id, event_limit=event_limit
+            )
             render_status(
-                campaign,
-                store.list_work_items(campaign_id),
-                store.list_jobs(campaign_id=campaign_id),
-                store.list_attempts(campaign_id=campaign_id),
-                store.list_resource_leases(campaign_id=campaign_id),
-                store.list_events(campaign_id=campaign_id),
-                managed_worktrees=worktrees,
-                worktree_operations=[
-                    operation
-                    for operation in store.list_worktree_operations()
-                    if str(operation["managed_worktree_id"]) in worktree_ids
-                ],
+                snapshot["campaign"],
+                snapshot["items"],
+                snapshot["jobs"],
+                snapshot["attempts"],
+                snapshot["resource_leases"],
+                snapshot["events"],
+                managed_worktrees=snapshot["managed_worktrees"],
+                worktree_operations=snapshot["worktree_operations"],
                 console=console,
+                as_of=_snapshot_time(snapshot),
                 event_limit=event_limit,
             )
-    except NotFoundError as error:
+    except StorageError as error:
         raise typer.BadParameter(str(error)) from error
+
+
+@app.command("watch")
+def watch(
+    campaign_id: str = typer.Argument(...),
+    database: Optional[Path] = typer.Option(None, "--database", "-d"),
+    refresh_seconds: float = typer.Option(
+        1.0, "--refresh", min=0.1, max=60.0
+    ),
+    event_limit: int = typer.Option(8, "--event-limit", min=0, max=100),
+    item_limit: int = typer.Option(
+        50,
+        "--item-limit",
+        min=1,
+        max=200,
+        help="Maximum item-detail rows per refresh; aggregate totals stay exact.",
+    ),
+    refresh_count: int = typer.Option(
+        0,
+        "--refresh-count",
+        min=0,
+        help="Stop after this many snapshots; zero watches until Ctrl+C.",
+    ),
+) -> None:
+    """Continuously render a read-only, transactionally consistent campaign monitor."""
+
+    if refresh_count == 0 and (
+        not console.is_terminal or console.is_dumb_terminal
+    ):
+        raise typer.BadParameter(
+            "an unbounded watch requires an interactive terminal; use `status` or "
+            "set --refresh-count"
+        )
+    stopped = False
+    try:
+        with _open_existing(database, read_only=True) as store:
+            snapshot = store.read_campaign_watch_snapshot(
+                campaign_id,
+                event_limit=event_limit,
+                item_limit=item_limit,
+            )
+            board = _watch_renderable(
+                snapshot,
+                event_limit=event_limit,
+                refresh_seconds=refresh_seconds,
+            )
+            rendered = 1
+            next_refresh = time.monotonic() + refresh_seconds
+            live = Live(
+                board,
+                console=console,
+                auto_refresh=False,
+                screen=False,
+                transient=False,
+                vertical_overflow=("ellipsis" if console.is_terminal else "visible"),
+            )
+            try:
+                live.start(refresh=True)
+                while refresh_count == 0 or rendered < refresh_count:
+                    time.sleep(max(0.0, next_refresh - time.monotonic()))
+                    try:
+                        snapshot = store.read_campaign_watch_snapshot(
+                            campaign_id,
+                            event_limit=event_limit,
+                            item_limit=item_limit,
+                        )
+                    except sqlite3.OperationalError as error:
+                        live.update(
+                            _watch_renderable(
+                                snapshot,
+                                event_limit=event_limit,
+                                refresh_seconds=refresh_seconds,
+                                stale_error=str(error),
+                            ),
+                            refresh=True,
+                        )
+                    else:
+                        live.update(
+                            _watch_renderable(
+                                snapshot,
+                                event_limit=event_limit,
+                                refresh_seconds=refresh_seconds,
+                            ),
+                            refresh=True,
+                        )
+                    rendered += 1
+                    next_refresh = time.monotonic() + refresh_seconds
+            finally:
+                live.stop()
+    except KeyboardInterrupt:
+        stopped = True
+    except (StorageError, sqlite3.Error) as error:
+        raise typer.BadParameter(str(error)) from error
+    if stopped:
+        console.print("Watch stopped; persisted state was not changed.")
 
 
 @app.command("worktree-provision")

@@ -60,8 +60,13 @@ Phase 1 is implemented, and the first Phase 2 vertical slice is implemented:
 - fake-CLI integration plus an authenticated, disposable, read-only Codex
   smoke run through Scheduler -> SQLite; and
 - a green opt-in fixed-fixture `prove-real-codex` acceptance command covering
-  authenticated investigator -> managed fixer -> same-worktree tester with
-  exact session, process, artifact, source, diff, test, lease, and SQLite proof.
+  authenticated investigator -> managed fixer -> deterministic same-worktree
+  focused tester with exact session, process, artifact, source, diff, test,
+  lease, and SQLite proof; and
+- a strict read-only `watch` terminal monitor with transactionally consistent,
+  bounded-detail campaign snapshots, exact aggregate totals, alert-prioritized
+  per-item lanes, worker/session/resource state, persisted alerts, non-TTY
+  protection, and clean `Ctrl+C` handling.
 
 Visible Chrome and application database adapters do not exist yet. General
 real-worker campaign execution remains intentionally disabled because generic
@@ -73,20 +78,17 @@ commands, browser flows, or database queries.
 Continue the real worker and environment adapters without weakening Phase 1's
 storage boundary:
 
-1. Add durable focused-test evidence collection that records the exact argv,
-   cwd, exit code, bounded stdout/stderr, hashes, and attempt/worktree fence.
-2. Keep general real-worker campaign/run CLI disabled until the focused-test
-   collector is storage-authoritative; never accept workspace paths from job
-   payloads.
-3. Add resource definitions for visible Chrome profiles, tenants, databases,
+1. Add resource definitions for visible Chrome profiles, tenants, databases,
    queues, and fixtures.
-4. Add real evidence collectors that register focused-test output, screenshots,
-   browser routes, SQL results, IDs, and hashes as durable artifacts.
-5. Add explicit operator interruption/resume CLI commands; use only the exact
+2. Add real evidence collectors that register screenshots, browser routes, SQL
+   results, IDs, and hashes as durable artifacts.
+3. Add explicit operator interruption/resume CLI commands; use only the exact
    external session ID already bound to the same logical job.
-6. Validate visible browser and application-database adapters in disposable
+4. Add an OS sandbox or trusted harness before allowing arbitrary repository
+   test code through the focused-test collector.
+5. Validate visible browser and application-database adapters in disposable
    fixtures before enabling any production repository.
-7. Build the native macOS worker-lane dashboard only after the CLI/runtime path
+6. Build the native macOS worker-lane dashboard only after the CLI/runtime path
    remains green.
 
 Do not add auto-push, auto-merge, auto-deploy, customer sends, production sync,

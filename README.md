@@ -84,7 +84,12 @@ focused-test collector:
   assume-unchanged, skip-worktree, or byte-level tracked changes, and retains
   the managed branch; and
 - the status board and explicit lifecycle CLI expose worktrees, operations,
-  process state, artifact hashes, and blockers.
+  process state, artifact hashes, and blockers; and
+- `watch` provides a compact live terminal monitor with per-item lanes,
+  persisted alerts, worker leases, sessions, resources, and recent events.
+  Status and watch use strict read-only SQLite connections, require the current
+  schema, never migrate, and read each screen from one transactionally
+  consistent snapshot with a bounded recent-event window.
 
 The fixed authenticated acceptance command creates its own private disposable
 repository, runs a source-only Codex investigator and an approved managed-
@@ -163,6 +168,27 @@ View persisted state without changing it:
 PYTHONPATH=src python3 -m agent_flow.cli status CAMPAIGN_ID
 ```
 
+Watch the production line in an interactive terminal until `Ctrl+C`:
+
+```bash
+PYTHONPATH=src python3 -m agent_flow.cli watch CAMPAIGN_ID --refresh 1.0
+```
+
+Live refreshes show exact campaign and worker totals while bounding detailed
+item rows to 50 by default. Use `--item-limit 100` when more detail is needed;
+the monitor visibly reports any omitted rows and prioritizes persisted alert
+rows inside the limit.
+
+For a bounded non-interactive capture, set an explicit snapshot count:
+
+```bash
+PYTHONPATH=src python3 -m agent_flow.cli watch CAMPAIGN_ID \
+  --refresh 1.0 --refresh-count 2
+```
+
+The monitor is read-only. It cannot start, interrupt, approve, retry, or mutate
+a campaign. Run `init` separately if the database needs a schema migration.
+
 Explicitly reconcile expired supervisor-owned external processes before
 starting new real work. This command exits nonzero if any identity remains
 ambiguous or quarantined:
@@ -224,6 +250,8 @@ PYTHONPATH=src python3 -m agent_flow.cli simulate \
 ## Persistence and safety
 
 - Runtime state defaults to `~/.agent-flow/agent-flow.sqlite3`.
+- `status` and `watch` open existing state in SQLite `mode=ro` with
+  `query_only=ON`; they fail closed on an outdated schema instead of migrating.
 - Tests and temporary demonstrations use `/private/tmp`.
 - Target repositories never receive Agent Flow runtime databases or evidence
   files.

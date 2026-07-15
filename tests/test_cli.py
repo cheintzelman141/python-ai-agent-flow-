@@ -1,6 +1,12 @@
+from io import BytesIO, StringIO
+import os
 from pathlib import Path
+import sqlite3
 import subprocess
+import sys
 
+import pexpect
+from rich.console import Console
 from typer.testing import CliRunner
 
 from agent_flow.cli import app
@@ -105,6 +111,246 @@ def test_cli_write_approval_is_explicit_and_idempotent(tmp_path: Path) -> None:
         approvals = store.list_approvals(campaign_id=campaign_id)
         assert len(approvals) == 1
         assert approvals[0]["status"] == "approved"
+
+
+def test_watch_refreshes_from_read_only_snapshots_without_writing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "watch-cli.sqlite3"
+    with SQLiteStore(database) as store:
+        campaign = store.create_campaign("Live watch proof")
+        store.create_work_item(
+            campaign["id"],
+            "First lane",
+            description="Visible on the first snapshot.",
+            initial_job={
+                "role": "investigator",
+                "stage": "investigate",
+                "active_item_state": "investigating",
+            },
+        )
+
+    refreshed = False
+
+    def add_second_item(_seconds: float) -> None:
+        nonlocal refreshed
+        if refreshed:
+            return
+        with SQLiteStore(database) as writer:
+            writer.create_work_item(
+                campaign["id"],
+                "Second lane",
+                description="Committed between live snapshots.",
+            )
+        refreshed = True
+
+    monkeypatch.setattr("agent_flow.cli.time.sleep", add_second_item)
+    watched = runner.invoke(
+        app,
+        [
+            "watch",
+            campaign["id"],
+            "--database",
+            str(database),
+            "--refresh",
+            "0.1",
+            "--refresh-count",
+            "2",
+        ],
+    )
+
+    assert watched.exit_code == 0, watched.output
+    normalized = " ".join(watched.output.split())
+    assert "READ-ONLY LIVE MONITOR" in watched.output
+    assert "Pipeline lanes" in watched.output
+    assert "First lane" in normalized
+    assert "Second lane" in normalized
+    with SQLiteStore(database) as store:
+        assert len(store.list_work_items(campaign["id"])) == 2
+        assert len(store.list_events(campaign_id=campaign["id"])) == 4
+
+
+def test_unbounded_watch_requires_terminal_and_interrupt_is_clean(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "watch-interrupt.sqlite3"
+    with SQLiteStore(database) as store:
+        campaign = store.create_campaign("Watch interrupt")
+
+    refused = runner.invoke(
+        app, ["watch", campaign["id"], "--database", str(database)]
+    )
+    assert refused.exit_code != 0
+    assert "unbounded watch requires an interactive terminal" in refused.output
+
+    def interrupt(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("agent_flow.cli.time.sleep", interrupt)
+    interrupted = runner.invoke(
+        app,
+        [
+            "watch",
+            campaign["id"],
+            "--database",
+            str(database),
+            "--refresh-count",
+            "2",
+        ],
+    )
+    assert interrupted.exit_code == 0, interrupted.output
+    assert "Watch stopped; persisted state was not changed." in interrupted.output
+
+
+def test_watch_marks_a_busy_refresh_stale_and_then_recovers(
+    tmp_path: Path, monkeypatch
+) -> None:
+    database = tmp_path / "watch-stale.sqlite3"
+    with SQLiteStore(database) as store:
+        campaign = store.create_campaign("Watch stale recovery")
+
+    original_snapshot = SQLiteStore.read_campaign_watch_snapshot
+    calls = 0
+
+    def intermittently_busy(
+        self,
+        campaign_id: str,
+        *,
+        event_limit: int = 8,
+        item_limit: int = 50,
+    ):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("database is busy")
+        return original_snapshot(
+            self,
+            campaign_id,
+            event_limit=event_limit,
+            item_limit=item_limit,
+        )
+
+    renderables = []
+
+    class RecordingLive:
+        def __init__(self, renderable, **_kwargs) -> None:
+            renderables.append(renderable)
+
+        def start(self, *, refresh: bool) -> None:
+            assert refresh is True
+            return None
+
+        def stop(self) -> None:
+            return None
+
+        def update(self, renderable, *, refresh: bool) -> None:
+            assert refresh is True
+            renderables.append(renderable)
+
+    monkeypatch.setattr(
+        "agent_flow.cli.SQLiteStore.read_campaign_watch_snapshot",
+        intermittently_busy,
+    )
+    monkeypatch.setattr("agent_flow.cli.Live", RecordingLive)
+    monkeypatch.setattr("agent_flow.cli.time.sleep", lambda _seconds: None)
+    watched = runner.invoke(
+        app,
+        [
+            "watch",
+            campaign["id"],
+            "--database",
+            str(database),
+            "--refresh-count",
+            "3",
+        ],
+    )
+
+    assert watched.exit_code == 0, watched.output
+    assert calls == 3
+    rendered = []
+    for renderable in renderables:
+        output = StringIO()
+        Console(file=output, width=120, color_system=None).print(renderable)
+        rendered.append(output.getvalue())
+    assert "READ-ONLY LIVE MONITOR" in rendered[0]
+    assert "STALE - database is busy" in rendered[1]
+    assert "READ-ONLY LIVE MONITOR" in rendered[2]
+
+
+def test_watch_restores_cursor_when_interrupted_during_initial_terminal_draw(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "watch-terminal.sqlite3"
+    with SQLiteStore(database) as store:
+        campaign = store.create_campaign("Watch terminal restoration")
+        for number in range(20):
+            store.create_work_item(
+                campaign["id"],
+                "Terminal row %02d" % number,
+                description="Ensure the initial Rich draw has enough output to interrupt.",
+            )
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["TERM"] = "xterm-256color"
+    output = BytesIO()
+    child = pexpect.spawn(
+        sys.executable,
+        [
+            "-m",
+            "agent_flow.cli",
+            "watch",
+            campaign["id"],
+            "--database",
+            str(database),
+            "--refresh",
+            "60",
+        ],
+        env=environment,
+        encoding=None,
+        timeout=10,
+    )
+    child.logfile_read = output
+    child.expect(b"Agent Flow - READ-ONLY LIVE MONITOR")
+    child.sendcontrol("c")
+    child.expect(pexpect.EOF)
+    child.close()
+
+    terminal_output = output.getvalue()
+    hidden = terminal_output.count(b"\x1b[?25l")
+    shown = terminal_output.count(b"\x1b[?25h")
+    assert child.exitstatus == 0
+    assert hidden >= 1
+    assert shown >= hidden
+
+
+def test_unbounded_watch_rejects_a_dumb_terminal(tmp_path: Path) -> None:
+    database = tmp_path / "watch-dumb-terminal.sqlite3"
+    with SQLiteStore(database) as store:
+        campaign = store.create_campaign("Watch dumb terminal")
+
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).parents[1] / "src")
+    environment["TERM"] = "dumb"
+    child = pexpect.spawn(
+        sys.executable,
+        [
+            "-m",
+            "agent_flow.cli",
+            "watch",
+            campaign["id"],
+            "--database",
+            str(database),
+        ],
+        env=environment,
+        encoding="utf-8",
+        timeout=10,
+    )
+    child.expect(pexpect.EOF)
+    child.close()
+
+    assert child.exitstatus != 0
+    assert "unbounded watch requires an interactive terminal" in child.before
 
 
 def test_cli_manages_and_displays_real_worktree_lifecycle(tmp_path: Path) -> None:

@@ -1,16 +1,21 @@
 from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
 import os
 from pathlib import Path
+import re
+import sqlite3
 from threading import Barrier, Event, Lock
 import time
-import sqlite3
 
 import pytest
+from rich.console import Console
 
+from agent_flow.status import build_watch_board
 from agent_flow.storage import (
     SCHEMA_VERSION,
     LeaseConflict,
     SQLiteStore,
+    StorageError,
     TransitionConflict,
     _SCHEMA_V1,
     _SCHEMA_V2,
@@ -254,6 +259,404 @@ def test_stage_commit_is_atomic_and_rolls_back_on_item_cas_failure(tmp_path: Pat
     assert "investigation.completed" in kinds
     assert "job.enqueued" in kinds
     store.close()
+
+
+def test_read_only_store_requires_current_schema_and_rejects_writes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "read-only.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("read-only proof")
+        events_before = writer.list_events(campaign_id=campaign["id"])
+
+    with SQLiteStore(path, read_only=True) as reader:
+        assert reader.read_only is True
+        assert reader._connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert reader.get_campaign(campaign["id"])["name"] == "read-only proof"
+        with pytest.raises(StorageError, match="write transactions are disabled"):
+            reader.create_campaign("must not be written")
+
+    with SQLiteStore(path) as writer:
+        assert writer.list_events(campaign_id=campaign["id"]) == events_before
+        writer._connection.execute("PRAGMA user_version = 6")
+
+    with pytest.raises(StorageError, match="run `agent-flow init`"):
+        SQLiteStore(path, read_only=True)
+    connection = sqlite3.connect(str(path))
+    try:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 6
+    finally:
+        connection.close()
+
+
+def test_campaign_status_snapshot_is_atomic_and_recent_events_are_bounded(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "atomic-status.sqlite3"
+    writer = SQLiteStore(path)
+    campaign = writer.create_campaign("atomic watch")
+    first = writer.create_work_item(
+        campaign["id"],
+        "first",
+        description="First snapshot item.",
+        initial_job={
+            "role": "investigator",
+            "stage": "investigate",
+            "active_item_state": "investigating",
+        },
+    )
+    reader = SQLiteStore(path, read_only=True)
+    original_list_items = reader.list_work_items
+    writer_committed = False
+
+    def interleaved_list_items(*args, **kwargs):
+        nonlocal writer_committed
+        items = original_list_items(*args, **kwargs)
+        writer.create_work_item(
+            campaign["id"],
+            "second",
+            description="Committed while the reader snapshot is open.",
+            initial_job={
+                "role": "investigator",
+                "stage": "investigate",
+                "active_item_state": "investigating",
+            },
+        )
+        writer_committed = True
+        return items
+
+    reader.list_work_items = interleaved_list_items  # type: ignore[method-assign]
+    snapshot = reader.read_campaign_status_snapshot(campaign["id"], event_limit=2)
+
+    assert writer_committed is True
+    assert [item["id"] for item in snapshot["items"]] == [first["id"]]
+    assert len(snapshot["jobs"]) == 1
+    assert len(snapshot["events"]) == 2
+    assert [event["sequence"] for event in snapshot["events"]] == [2, 3]
+    assert len(writer.list_work_items(campaign["id"])) == 2
+    assert len(writer.list_events(campaign_id=campaign["id"])) == 5
+    indexes = {
+        row["name"]
+        for row in writer._connection.execute("PRAGMA index_list(events)").fetchall()
+    }
+    assert "events_campaign_sequence" in indexes
+    reader.close()
+    writer.close()
+
+
+def test_status_snapshot_clock_is_conservative_across_concurrent_heartbeat(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "status-heartbeat.sqlite3"
+    clock = ManualClock()
+    writer, campaign, item = seeded_store(path, clock)
+    job = enqueue_investigation(writer, item["id"])
+    claim = writer.claim_job("investigator", "worker-a", lease_seconds=5)
+    assert claim is not None
+    reader = SQLiteStore(path, clock=clock, read_only=True)
+    original_get_campaign = reader.get_campaign
+
+    def heartbeat_after_snapshot_anchor(campaign_id: str):
+        persisted_campaign = original_get_campaign(campaign_id)
+        clock.advance(4)
+        assert writer.heartbeat_job(
+            job["id"],
+            "worker-a",
+            claim["lease_token"],
+            lease_seconds=60,
+        )
+        clock.advance(2)
+        return persisted_campaign
+
+    reader.get_campaign = heartbeat_after_snapshot_anchor  # type: ignore[method-assign]
+    snapshot = reader.read_campaign_status_snapshot(campaign["id"])
+
+    assert snapshot["captured_at"] == 1_000
+    assert snapshot["jobs"][0]["lease_expires_at"] == 1_005
+    assert snapshot["jobs"][0]["lease_expires_at"] > snapshot["captured_at"]
+    assert writer.get_job(job["id"])["lease_expires_at"] == 1_064
+    reader.close()
+    writer.close()
+
+
+def test_watch_snapshot_bounds_detail_but_keeps_exact_campaign_totals(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-bounded.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("Bounded watch")
+        for number in range(7):
+            writer.create_work_item(
+                campaign["id"],
+                "Item %d" % number,
+                description="Bounded live-monitor detail.",
+                initial_job={
+                    "role": "investigator",
+                    "stage": "investigate",
+                    "active_item_state": "investigating",
+                },
+            )
+
+    with SQLiteStore(path, read_only=True) as reader:
+        snapshot = reader.read_campaign_watch_snapshot(
+            campaign["id"], event_limit=2, item_limit=3
+        )
+
+    assert snapshot["total_items"] == 7
+    assert snapshot["item_state_counts"] == {"backlog": 7}
+    assert snapshot["worker_counts"]["investigator"] == {
+        "queued": 7,
+        "active": 0,
+        "expired": 0,
+    }
+    assert len(snapshot["items"]) == 3
+    assert len(snapshot["jobs"]) == 3
+    assert snapshot["omitted_item_count"] == 4
+    assert len(snapshot["events"]) == 2
+
+
+def test_watch_snapshot_rejects_unbounded_item_limits(tmp_path: Path) -> None:
+    path = tmp_path / "watch-limit.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("Watch limits")
+    with SQLiteStore(path, read_only=True) as reader:
+        for item_limit in (0, 201, True):
+            with pytest.raises(ValueError, match="item_limit"):
+                reader.read_campaign_watch_snapshot(
+                    campaign["id"], item_limit=item_limit
+                )
+
+
+def test_watch_snapshot_prioritizes_alert_rows_before_ordinary_detail(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-alert-priority.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("Watch alert priority")
+        writer.create_work_item(
+            campaign["id"],
+            "Ordinary high priority item",
+            description="Would otherwise sort first.",
+            priority=100,
+        )
+        blocked = writer.create_work_item(
+            campaign["id"],
+            "Blocked low priority item",
+            description="Must remain visible to the operator.",
+            state="blocked",
+        )
+        writer.create_work_item(
+            campaign["id"],
+            "Second blocked item",
+            description="Must be counted even outside the detail limit.",
+            state="blocked",
+        )
+
+    with SQLiteStore(path, read_only=True) as reader:
+        snapshot = reader.read_campaign_watch_snapshot(
+            campaign["id"], item_limit=1
+        )
+
+    assert [item["id"] for item in snapshot["items"]] == [blocked["id"]]
+    assert snapshot["omitted_item_count"] == 2
+    assert snapshot["omitted_alert_item_count"] == 1
+
+
+def test_watch_snapshot_prioritizes_expired_worker_over_blocked_item_limit(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-mixed-severity.sqlite3"
+    clock = ManualClock()
+    with SQLiteStore(path, clock=clock) as writer:
+        campaign = writer.create_campaign("Watch mixed severity")
+        blocked_ids = []
+        for number in range(50):
+            blocked = writer.create_work_item(
+                campaign["id"],
+                "Blocked item %02d" % number,
+                description="High-priority blocked monitor row.",
+                state="blocked",
+                priority=100,
+            )
+            blocked_ids.append(blocked["id"])
+        expired_item = writer.create_work_item(
+            campaign["id"],
+            "Expired low-priority worker",
+            description="Expired execution hazards outrank blocked rows.",
+            priority=0,
+        )
+        expired_job = enqueue_investigation(
+            writer,
+            expired_item["id"],
+            resource="tenant:expired-watch",
+            stage="expired-watch",
+        )
+        claim = writer.claim_job(
+            "investigator", "expired-worker", lease_seconds=5
+        )
+        assert claim is not None
+        assert claim["id"] == expired_job["id"]
+        clock.advance(6)
+
+    with SQLiteStore(path, clock=clock, read_only=True) as reader:
+        snapshot = reader.read_campaign_watch_snapshot(
+            campaign["id"], item_limit=50
+        )
+
+    selected_ids = [item["id"] for item in snapshot["items"]]
+    assert selected_ids[0] == expired_item["id"]
+    assert expired_item["id"] in selected_ids
+    assert len(set(blocked_ids) & set(selected_ids)) == 49
+    assert snapshot["omitted_item_count"] == 1
+    assert snapshot["omitted_alert_item_count"] == 1
+    assert snapshot["worker_counts"]["investigator"] == {
+        "queued": 0,
+        "active": 0,
+        "expired": 1,
+    }
+
+
+def test_watch_snapshot_prioritizes_ambiguous_item_and_counts_open_jobs(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-ambiguous-priority.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("Watch ambiguous priority")
+        ordinary = writer.create_work_item(
+            campaign["id"],
+            "Ordinary high-priority item",
+            description="Priority alone must not hide an ambiguous lane.",
+            priority=100,
+        )
+        ambiguous = writer.create_work_item(
+            campaign["id"],
+            "Ambiguous low-priority item",
+            description="Two distinct open stages require reconciliation.",
+            priority=0,
+        )
+        for number in range(2):
+            enqueue_investigation(
+                writer,
+                ambiguous["id"],
+                resource="tenant:ambiguous-%d" % number,
+                stage="ambiguous-stage-%d" % number,
+            )
+
+    with SQLiteStore(path, read_only=True) as reader:
+        snapshot = reader.read_campaign_watch_snapshot(
+            campaign["id"], item_limit=1
+        )
+
+    assert ordinary["id"] not in [item["id"] for item in snapshot["items"]]
+    assert [item["id"] for item in snapshot["items"]] == [ambiguous["id"]]
+    assert snapshot["items"][0]["open_job_count"] == 2
+    assert len(snapshot["jobs"]) == 1
+    assert snapshot["omitted_item_count"] == 1
+    assert snapshot["omitted_alert_item_count"] == 0
+    assert snapshot["omitted_open_job_count"] == 1
+
+
+def test_watch_snapshot_bounds_more_than_one_thousand_open_job_records(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-open-job-scale.sqlite3"
+    with SQLiteStore(path) as writer:
+        campaign = writer.create_campaign("Watch open-job scale")
+        item = writer.create_work_item(
+            campaign["id"],
+            "Large ambiguous lane",
+            description="One item has more jobs than SQLite's legacy bind limit.",
+        )
+        for number in range(1_001):
+            enqueue_investigation(
+                writer,
+                item["id"],
+                resource="tenant:scale",
+                stage="scale-stage-%04d" % number,
+            )
+
+    with SQLiteStore(path, read_only=True) as reader:
+        snapshot = reader.read_campaign_watch_snapshot(
+            campaign["id"], event_limit=2, item_limit=1
+        )
+
+    assert snapshot["items"][0]["open_job_count"] == 1_001
+    assert len(snapshot["jobs"]) == 1
+    assert snapshot["worker_counts"]["investigator"]["queued"] == 1_001
+    assert snapshot["omitted_open_job_count"] == 1_000
+    assert snapshot["omitted_item_count"] == 0
+    assert snapshot["omitted_alert_item_count"] == 0
+
+    output = StringIO()
+    console = Console(
+        file=output,
+        width=120,
+        color_system=None,
+        force_terminal=False,
+    )
+    console.print(
+        build_watch_board(
+            snapshot["campaign"],
+            snapshot["items"],
+            snapshot["jobs"],
+            snapshot["attempts"],
+            snapshot["resource_leases"],
+            snapshot["events"],
+            item_state_counts=snapshot["item_state_counts"],
+            worker_counts=snapshot["worker_counts"],
+            total_items=snapshot["total_items"],
+            omitted_item_count=snapshot["omitted_item_count"],
+            omitted_alert_item_count=snapshot["omitted_alert_item_count"],
+            omitted_open_job_count=snapshot["omitted_open_job_count"],
+        )
+    )
+    rendered = re.sub(r"\s+", " ", output.getvalue())
+    assert "AMBIGUOUS" in rendered
+    assert "1001 open jobs require storage reconciliation" in rendered
+    assert (
+        "1000 additional open job records are summarized by exact per-item "
+        "ambiguity counts" in rendered
+    )
+
+
+def test_campaign_worktree_operation_query_uses_scoped_indexes(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "watch-worktree-query-plan.sqlite3"
+    with SQLiteStore(path) as store:
+        campaign = store.create_campaign("Watch worktree query plan")
+        traced_statements = []
+        store._connection.set_trace_callback(traced_statements.append)
+        try:
+            assert store.list_worktree_operations(campaign_id=campaign["id"]) == []
+        finally:
+            store._connection.set_trace_callback(None)
+
+        query = next(
+            statement
+            for statement in traced_statements
+            if "FROM worktree_operations o" in statement
+        )
+        plan = [
+            str(row["detail"])
+            for row in store._connection.execute(
+                "EXPLAIN QUERY PLAN " + query
+            ).fetchall()
+        ]
+
+    assert any(
+        "SEARCH managed_worktrees USING COVERING INDEX managed_worktrees_campaign"
+        in detail
+        for detail in plan
+    )
+    assert any(
+        "SEARCH o USING INDEX" in detail and "managed_worktree_id=?" in detail
+        for detail in plan
+    )
+    assert not any(
+        detail.startswith("SCAN o") or "SCAN worktree_operations" in detail
+        for detail in plan
+    )
 
 
 def test_claim_skips_resource_blocked_head_of_line_job(tmp_path: Path) -> None:
@@ -626,7 +1029,7 @@ def test_schema_v1_database_migrates_external_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 7
     assert {
         "external_provider",
         "external_session_id",
@@ -661,7 +1064,7 @@ def test_schema_v2_database_migrates_process_and_worktree_fields_to_v5(
             for row in store._connection.execute("PRAGMA table_info(attempts)").fetchall()
         }
 
-    assert version == SCHEMA_VERSION == 6
+    assert version == SCHEMA_VERSION == 7
     assert {
         "external_provider",
         "external_session_id",
