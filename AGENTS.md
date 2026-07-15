@@ -145,6 +145,24 @@ Schema-v11 legacy campaigns cannot prepare an authoritative focused execution
 without an exact admission. Simulation-only Phase 1 campaigns remain available
 under their explicit `allow_simulated_evidence` contract.
 
+
+## Phase 2 admission-bound collector correction
+
+The current schema-v11 focused-test admission is also revalidated by the
+supervisor-owned browser and database collectors before they execute or
+canonicalize evidence. Browser guardian release now uses the same transactional
+release fence pattern as focused tests, so revocation and target launch have one
+durable ordering. The SQLite database collector is revalidated immediately
+before the bounded read and again before completion. Revocation remains allowed
+to clear, terminate, and reap already-recorded process groups; it does not
+authorize new browser launches or database reads.
+
+This correction does not expose general real-campaign execution. The missing
+pre-launch campaign/repository admission remains the next schema revision and
+must still consume an explicit operator approval before any general investigator,
+managed-worktree, fixer, tester, browser, or database boundary can run against a
+non-disposable target.
+
 ## Architecture Rules
 
 - The scheduler and storage layer, not an LLM, own state transitions.

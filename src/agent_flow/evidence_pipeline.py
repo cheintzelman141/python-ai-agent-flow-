@@ -56,6 +56,9 @@ class EvidencePipelineWorker:
             )
 
         database_contract = dict(context.prepare_database_query_execution())
+        database_contract = dict(
+            context.authorize_database_query_execution(database_contract)
+        )
         database_task = asyncio.create_task(
             asyncio.to_thread(
                 self.database_collector.collect,
@@ -147,6 +150,7 @@ class EvidencePipelineWorker:
                     "browser_evidence", identity, target
                 ),
                 clear_process=context.clear_external_process,
+                release_fence=context.browser_guardian_release_fence,
                 cancellation_event=cancellation_event,
             )
 

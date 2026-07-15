@@ -2076,6 +2076,9 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
+            admission = self._assert_attempt_collector_admission(
+                connection, job, attempt, "browser"
+            )
             existing = connection.execute(
                 "SELECT * FROM browser_evidence_executions WHERE attempt_id = ?",
                 (attempt["id"],),
@@ -2130,6 +2133,8 @@ class SQLiteStore:
                     "attempt_id": attempt["id"],
                     "resource_id": plan["resource_definition_id"],
                     "resource_identity_hash": plan["resource_identity_hash"],
+                    "focused_test_admission_id": admission["id"],
+                    "focused_test_admission_sha256": admission["authority_sha256"],
                 },
                 created_at=now,
             )
@@ -2214,6 +2219,7 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
+            self._assert_attempt_collector_admission(connection, job, attempt, "browser")
             if (
                 execution_row["job_id"] != job_id
                 or execution_row["attempt_id"] != attempt["id"]
@@ -2398,6 +2404,9 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
+            admission = self._assert_attempt_collector_admission(
+                connection, job, attempt, "database"
+            )
             existing = connection.execute(
                 "SELECT * FROM database_query_executions WHERE attempt_id = ?",
                 (attempt["id"],),
@@ -2452,6 +2461,8 @@ class SQLiteStore:
                     "resource_id": plan["resource_definition_id"],
                     "resource_identity_hash": plan["resource_identity_hash"],
                     "query_sha256": plan["query_sha256"],
+                    "focused_test_admission_id": admission["id"],
+                    "focused_test_admission_sha256": admission["authority_sha256"],
                 },
                 created_at=now,
             )
@@ -2608,6 +2619,7 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
+            self._assert_attempt_collector_admission(connection, job, attempt, "database")
             if (
                 execution_row["job_id"] != job_id
                 or execution_row["attempt_id"] != attempt["id"]
@@ -6607,7 +6619,93 @@ class SQLiteStore:
             ).fetchone()
             return self._row(recorded)  # type: ignore[return-value]
 
+    def authorize_database_query_execution(
+        self,
+        execution_id: str,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+    ) -> Dict[str, Any]:
+        execution_id = self._exact_collector_id(execution_id, "database execution")
+        with self._transaction() as connection:
+            now = self._clock()
+            execution = connection.execute(
+                "SELECT * FROM database_query_executions WHERE id = ?",
+                (execution_id,),
+            ).fetchone()
+            if execution is None or execution["status"] != "prepared":
+                raise LeaseConflict("database execution is not ready for query")
+            job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (job["current_attempt_id"],)
+            ).fetchone()
+            if attempt is None or execution["attempt_id"] != attempt["id"]:
+                raise LeaseConflict("database execution belongs to another attempt")
+            self._assert_attempt_collector_admission(connection, job, attempt, "database")
+            plan_row = connection.execute(
+                "SELECT * FROM database_query_plans WHERE id = ?", (execution["plan_id"],)
+            ).fetchone()
+            if plan_row is None:
+                raise LeaseConflict("database query plan disappeared")
+            plan = self._validated_database_plan_row(connection, plan_row)
+            return self._database_execution_contract(self._row(execution), plan, connection)
+
     @contextmanager
+    def browser_guardian_release_fence(
+        self,
+        job_id: str,
+        worker_id: str,
+        lease_token: str,
+        process_id: int,
+        process_group_id: int,
+        owner_uid: int,
+        kernel_executable: str,
+        start_seconds: int,
+        start_microseconds: int,
+        target_executable: str,
+    ) -> Iterator[None]:
+        """Serialize exact browser guardian release against admission revocation."""
+
+        with self._transaction() as connection:
+            now = self._clock()
+            job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
+            attempt = connection.execute(
+                "SELECT * FROM attempts WHERE id = ?", (job["current_attempt_id"],)
+            ).fetchone()
+            if attempt is None:
+                raise LeaseConflict("browser guardian release has no current attempt")
+            self._assert_attempt_collector_admission(connection, job, attempt, "browser")
+            execution = connection.execute(
+                """SELECT * FROM browser_evidence_executions
+                   WHERE attempt_id = ? AND job_id = ? AND status = 'prepared'""",
+                (job["current_attempt_id"], job["id"]),
+            ).fetchone()
+            external = connection.execute(
+                """SELECT * FROM external_processes
+                   WHERE attempt_id = ? AND job_id = ? AND provider = 'browser_evidence'
+                     AND state = 'active'
+                   ORDER BY recorded_at DESC, id DESC LIMIT 1""",
+                (job["current_attempt_id"], job["id"]),
+            ).fetchone()
+            if execution is None or external is None:
+                raise LeaseConflict(
+                    "browser guardian release lacks prepared execution and process authority"
+                )
+            expected_process = (
+                int(process_id), int(process_group_id), int(owner_uid),
+                str(kernel_executable), int(start_seconds), int(start_microseconds),
+                str(target_executable),
+            )
+            persisted_process = (
+                int(external["process_id"]), int(external["process_group_id"]),
+                int(external["owner_uid"]), str(external["kernel_executable"]),
+                int(external["start_seconds"]), int(external["start_microseconds"]),
+                str(external["target_executable"]),
+            )
+            if expected_process != persisted_process or process_id != process_group_id:
+                raise LeaseConflict("browser guardian release process identity changed")
+            yield
+
     def focused_test_guardian_release_fence(
         self,
         job_id: str,
