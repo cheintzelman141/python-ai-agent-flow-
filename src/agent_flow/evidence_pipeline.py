@@ -64,16 +64,17 @@ class EvidencePipelineWorker:
                 self.database_collector.collect,
                 database_contract,
             )
+        )
+        try:
+            database_result = await asyncio.shield(database_task)
+        except asyncio.CancelledError:
+            # The query is read-only and bounded.  Do not release its resource
+            # fence while a background thread can still be using it.
             try:
-                database_result = await asyncio.shield(database_task)
-            except asyncio.CancelledError:
-                # The query is read-only and bounded.  Do not release its resource
-                # fence while a background thread can still be using it.
-                try:
-                    await asyncio.shield(database_task)
-                except Exception:
-                    pass
-                raise
+                await asyncio.shield(database_task)
+            except Exception:
+                pass
+            raise
         database = dict(
             context.complete_database_query_execution(database_result)
         )
