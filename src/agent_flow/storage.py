@@ -2088,7 +2088,7 @@ class SQLiteStore:
                 now=now,
             )
             admission = self._assert_attempt_collector_admission(
-                connection, job, attempt, "browser", plan
+                connection, job, attempt, "browser"
             )
             existing = connection.execute(
                 "SELECT * FROM browser_evidence_executions WHERE attempt_id = ?",
@@ -2230,7 +2230,7 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
-            self._assert_attempt_collector_admission(connection, job, attempt, "browser", plan)
+            self._assert_attempt_collector_admission(connection, job, attempt, "browser")
             if (
                 execution_row["job_id"] != job_id
                 or execution_row["attempt_id"] != attempt["id"]
@@ -2416,7 +2416,7 @@ class SQLiteStore:
                 now=now,
             )
             admission = self._assert_attempt_collector_admission(
-                connection, job, attempt, "database", plan
+                connection, job, attempt, "database"
             )
             existing = connection.execute(
                 "SELECT * FROM database_query_executions WHERE attempt_id = ?",
@@ -2630,7 +2630,7 @@ class SQLiteStore:
                 resource_definition_id=str(plan["resource_definition_id"]),
                 now=now,
             )
-            self._assert_attempt_collector_admission(connection, job, attempt, "database", plan)
+            self._assert_attempt_collector_admission(connection, job, attempt, "database")
             if (
                 execution_row["job_id"] != job_id
                 or execution_row["attempt_id"] != attempt["id"]
@@ -6745,47 +6745,14 @@ class SQLiteStore:
             ).fetchone()
             if attempt is None or execution["attempt_id"] != attempt["id"]:
                 raise LeaseConflict("database execution belongs to another attempt")
+            self._assert_attempt_collector_admission(connection, job, attempt, "database")
             plan_row = connection.execute(
                 "SELECT * FROM database_query_plans WHERE id = ?", (execution["plan_id"],)
             ).fetchone()
             if plan_row is None:
                 raise LeaseConflict("database query plan disappeared")
             plan = self._validated_database_plan_row(connection, plan_row)
-            self._assert_attempt_collector_admission(connection, job, attempt, "database", plan)
             return self._database_execution_contract(self._row(execution), plan, connection)
-
-    @contextmanager
-    def database_query_execution_fence(
-        self,
-        execution_id: str,
-        job_id: str,
-        worker_id: str,
-        lease_token: str,
-    ) -> Iterator[Dict[str, Any]]:
-        execution_id = self._exact_collector_id(execution_id, "database execution")
-        with self._transaction() as connection:
-            now = self._clock()
-            execution = connection.execute(
-                "SELECT * FROM database_query_executions WHERE id = ?",
-                (execution_id,),
-            ).fetchone()
-            if execution is None or execution["status"] != "prepared":
-                raise LeaseConflict("database execution is not ready for query")
-            plan_row = connection.execute(
-                "SELECT * FROM database_query_plans WHERE id = ?",
-                (execution["plan_id"],),
-            ).fetchone()
-            if plan_row is None:
-                raise LeaseConflict("database query plan disappeared")
-            plan = self._validated_database_plan_row(connection, plan_row)
-            job = self._assert_live_lease(connection, job_id, worker_id, lease_token, now)
-            attempt = connection.execute(
-                "SELECT * FROM attempts WHERE id = ?", (job["current_attempt_id"],)
-            ).fetchone()
-            if attempt is None or execution["attempt_id"] != attempt["id"]:
-                raise LeaseConflict("database execution belongs to another attempt")
-            self._assert_attempt_collector_admission(connection, job, attempt, "database", plan)
-            yield self._database_execution_contract(self._row(execution), plan, connection)
 
     @contextmanager
     def browser_guardian_release_fence(
@@ -6811,6 +6778,7 @@ class SQLiteStore:
             ).fetchone()
             if attempt is None:
                 raise LeaseConflict("browser guardian release has no current attempt")
+            self._assert_attempt_collector_admission(connection, job, attempt, "browser")
             execution = connection.execute(
                 """SELECT * FROM browser_evidence_executions
                    WHERE attempt_id = ? AND job_id = ? AND status = 'prepared'""",
@@ -6827,14 +6795,6 @@ class SQLiteStore:
                 raise LeaseConflict(
                     "browser guardian release lacks prepared execution and process authority"
                 )
-            plan_row = connection.execute(
-                "SELECT * FROM browser_evidence_plans WHERE id = ?",
-                (execution["plan_id"],),
-            ).fetchone()
-            if plan_row is None:
-                raise LeaseConflict("browser guardian release plan disappeared")
-            plan = self._validated_browser_plan_row(connection, plan_row)
-            self._assert_attempt_collector_admission(connection, job, attempt, "browser", plan)
             expected_process = (
                 int(process_id), int(process_group_id), int(owner_uid),
                 str(kernel_executable), int(start_seconds), int(start_microseconds),
@@ -6850,7 +6810,6 @@ class SQLiteStore:
                 raise LeaseConflict("browser guardian release process identity changed")
             yield
 
-    @contextmanager
     def focused_test_guardian_release_fence(
         self,
         job_id: str,

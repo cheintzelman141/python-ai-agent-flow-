@@ -70,8 +70,8 @@ class WorkerContext:
     _database_query_execution_completer: Optional[
         Callable[[Mapping[str, Any]], Mapping[str, Any]]
     ] = field(default=None, repr=False, compare=False)
-    _database_query_execution_fencer: Optional[
-        Callable[[Mapping[str, Any]], ContextManager[Mapping[str, Any]]]
+    _database_query_execution_authorizer: Optional[
+        Callable[[Mapping[str, Any]], Mapping[str, Any]]
     ] = field(default=None, repr=False, compare=False)
 
     @property
@@ -132,11 +132,13 @@ class WorkerContext:
     ) -> ContextManager[None]:
         """Serialize exact browser guardian release against admission revocation."""
 
-        if self._browser_guardian_release_fencer is None:
-            raise WorkerExecutionError(
-                "this worker context cannot authorize browser guardian release"
-            )
-        return self._browser_guardian_release_fencer(identity, target_executable)
+        if self._browser_guardian_release_fencer is not None:
+            return self._browser_guardian_release_fencer(identity, target_executable)
+        if self._focused_test_guardian_release_fencer is not None:
+            return self._focused_test_guardian_release_fencer(identity, target_executable)
+        raise WorkerExecutionError(
+            "this worker context cannot authorize browser guardian release"
+        )
 
     def record_artifact(
         self, kind: str, uri: str, metadata: Mapping[str, Any]
@@ -247,16 +249,14 @@ class WorkerContext:
             )
         return prepared
 
-    def database_query_execution_fence(
+    def authorize_database_query_execution(
         self, contract: Mapping[str, Any]
-    ) -> ContextManager[Mapping[str, Any]]:
-        """Serialize the exact database read against admission revocation."""
+    ) -> Mapping[str, Any]:
+        """Revalidate an attempt-pinned database admission immediately before query."""
 
-        if self._database_query_execution_fencer is None:
-            raise WorkerExecutionError(
-                "this worker context cannot authorize database query execution"
-            )
-        return self._database_query_execution_fencer(contract)
+        if self._database_query_execution_authorizer is None:
+            return contract
+        return self._database_query_execution_authorizer(contract)
 
     def complete_database_query_execution(
         self, result: Mapping[str, Any]

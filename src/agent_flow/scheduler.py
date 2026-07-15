@@ -143,15 +143,6 @@ class Storage(Protocol):
     ) -> ContextManager[None]:
         """Serialize browser guardian release against admission revocation."""
 
-    def database_query_execution_fence(
-        self,
-        job_id: str,
-        worker_id: str,
-        lease_token: str,
-        contract: Mapping[str, Any],
-    ) -> ContextManager[Mapping[str, Any]]:
-        """Serialize database query execution against admission revocation."""
-
     def clear_external_process(
         self,
         job_id: str,
@@ -652,10 +643,10 @@ class Scheduler:
             def prepare_database_query_execution() -> Mapping[str, Any]:
                 return self._prepare_database_query_execution(slot, job)
 
-            def database_query_execution_fence(
+            def authorize_database_query_execution(
                 contract: Mapping[str, Any],
-            ) -> ContextManager[Mapping[str, Any]]:
-                return self._database_query_execution_fence(slot, job, contract)
+            ) -> Mapping[str, Any]:
+                return self._authorize_database_query_execution(slot, job, contract)
 
             def complete_database_query_execution(
                 result: Mapping[str, Any],
@@ -686,7 +677,7 @@ class Scheduler:
                 ),
                 _database_query_execution_preparer=prepare_database_query_execution,
                 _database_query_execution_completer=complete_database_query_execution,
-                _database_query_execution_fencer=database_query_execution_fence,
+                _database_query_execution_authorizer=authorize_database_query_execution,
             )
             output = await self._run_worker_with_heartbeat(slot, job, context)
             pending_interrupt = self._poll_operator_interrupt(slot, job)
@@ -961,15 +952,18 @@ class Scheduler:
             )
         return prepared
 
-    def _database_query_execution_fence(
+    def _authorize_database_query_execution(
         self, slot: _WorkerSlot, job: Job, contract: Mapping[str, Any]
-    ) -> ContextManager[Mapping[str, Any]]:
+    ) -> Mapping[str, Any]:
         lease_token = job.lease_token
         if lease_token is None:
             raise LeaseLost("claimed job has no lease token")
-        return self.storage.database_query_execution_fence(
+        authorized = self.storage.authorize_database_query_execution(
             job.id, slot.worker_id, lease_token, contract
         )
+        if authorized is None:
+            raise LeaseLost("database query authorization rejected the stale lease fence")
+        return authorized
 
     def _complete_database_query_execution(
         self,

@@ -500,12 +500,15 @@ class SQLiteSchedulerStorage:
         except LeaseConflict:
             return None
 
-    def database_query_execution_fence(
+    def authorize_database_query_execution(
         self, job_id: str, worker_id: str, lease_token: str, contract: Mapping[str, Any]
-    ) -> ContextManager[Mapping[str, Any]]:
-        return self.store.database_query_execution_fence(
-            str(contract.get("id", "")), job_id, worker_id, lease_token
-        )
+    ) -> Optional[Mapping[str, Any]]:
+        try:
+            return self.store.authorize_database_query_execution(
+                str(contract.get("id", "")), job_id, worker_id, lease_token
+            )
+        except LeaseConflict:
+            return None
 
     def complete_database_query_execution(
         self,

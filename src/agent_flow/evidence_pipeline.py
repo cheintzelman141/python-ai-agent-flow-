@@ -56,13 +56,13 @@ class EvidencePipelineWorker:
             )
 
         database_contract = dict(context.prepare_database_query_execution())
-        with context.database_query_execution_fence(database_contract) as authorized_contract:
-            database_contract = dict(authorized_contract)
-            database_task = asyncio.create_task(
-                asyncio.to_thread(
-                    self.database_collector.collect,
-                    database_contract,
-                )
+        database_contract = dict(
+            context.authorize_database_query_execution(database_contract)
+        )
+        database_task = asyncio.create_task(
+            asyncio.to_thread(
+                self.database_collector.collect,
+                database_contract,
             )
             try:
                 database_result = await asyncio.shield(database_task)
