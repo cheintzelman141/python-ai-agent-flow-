@@ -110,7 +110,30 @@ focused-test collector:
 - `operator-interrupt` records an exact current lease/attempt/process/session/
   worktree/resource request for scheduler-owned cancellation and reap.
   `operator-resume` replaces automatic resume with one explicit, one-time,
-  same-job authorization for the exact stopped external session.
+  same-job authorization for the exact stopped external session; and
+- schema-v10 focused executions persist and independently reconstruct an exact
+  macOS Seatbelt profile before launch. The fixed `unittest` selector can read
+  only its managed worktree, a root-owned byte-hashed Python runtime, the
+  required system libraries, and its private scratch tree; worktree writes,
+  other same-user file contents and directory listings, networking, forks,
+  other executables, and detached children are denied by the OS policy; and
+- schema-v11 adds an internal focused-test admission precursor. It binds one
+  exact pending tester job to the campaign/configuration hash, item gates,
+  payload, source and worktree identities, worktree generation, immutable
+  schema-v10 plan, complete resource set, and exact registered-definition
+  hashes. The `fta_...` identity is pinned to every admitted attempt and
+  revalidated through heartbeat, guardian registration, collection, completion,
+  and finalization. Guardian release is serialized against revocation by
+  holding the admission transaction through the exact barrier write.
+  Revocation and authority drift fail closed. This is an attributed internal
+  contract, not an operator approval or public CLI.
+
+Schema migration does not retroactively trust an already prepared focused
+execution. A schema-v9 plan can receive one new schema-v10 revision, but legacy
+prepared executions remain fail-closed and must be replaced by a fresh fenced
+attempt with an exact schema-v11 admission before they can produce canonical
+evidence. Explicit Phase 1 simulation remains compatible only when
+`allow_simulated_evidence` is enabled; it is not authoritative focused proof.
 
 The fixed authenticated acceptance command creates its own private disposable
 repository, runs a source-only Codex investigator and an approved managed-
@@ -118,9 +141,11 @@ worktree Codex fixer, then gives testing to a deterministic focused-test worker.
 The supervisor, not an LLM, owns that test command and persists its immutable,
 revisioned plan snapshot, managed-worktree generation, process identity,
 bounded stdout/stderr, hashes, semantic result, and canonical test handoff
-before the item can become green. A RED result can return through the fixer and
-receive a new plan revision; the trusted executable, test bytes, selector,
-environment, and limits cannot change between revisions.
+before the item can become green. The command creates and later proves one exact
+schema-v11 admission for its pending tester. A RED result becomes BLOCKED with
+the captured test evidence because this post-fix precursor has no authority to
+launch another fixer; a new fix cycle requires the separately approved
+pre-launch admission described below.
 The final assessment reconciles the exact one-file diff, two distinct Codex
 sessions, all three reaped process groups, authoritative test execution,
 artifact hashes, released leases, unchanged source, and SQLite foreign-key
@@ -130,14 +155,27 @@ The real adapter is intentionally not exposed as a general campaign CLI yet.
 The managed-worktree lifecycle, fixed proof command, and fixed disposable
 three-gate pipeline are available, but they do not authorize arbitrary
 repository test code, browser actions, SQL, credentials, or target paths. The
-focused collector does not yet block same-user filesystem access, network
-access, or detached subprocesses, and transcript parsing is not a trusted
-general test harness. Existing browser profiles and application databases are
-not authorized by resource registration alone; the current collectors accept
-only supervisor-prepared disposable contracts, and the database implementation
-is SQLite-only. GL collection remains unimplemented. General real-worker
-execution stays disabled until an OS sandbox or a narrowly trusted harness
-proves the remaining filesystem/network/child-process boundary.
+schema-v10 focused collector closes the same-user file-content/directory-list,
+network, fork, other-executable, and detached-child boundary only for its exact
+supervisor-owned macOS `unittest` plan. It is not authority for worker-supplied
+commands or paths, and its exact-selector transcript evaluator is not a general
+test framework. Existing browser profiles and application databases are not
+authorized by resource registration alone; the current collectors accept only
+supervisor-prepared disposable contracts, and the database implementation is
+SQLite-only. GL collection remains unimplemented. General real-worker campaign
+execution stays disabled until a separately approved campaign-admission path
+binds exact repositories, worktrees, test plans, and resource definitions
+without accepting worker-selected authority.
+
+The schema-v11 precursor is intentionally narrower than that missing general
+admission path: it can be created only after investigation, worktree
+provisioning, and fixing have already completed. Its persisted campaign mode
+blocks any later investigator/fixer claim or new worktree request, but it does
+not retroactively authorize those earlier launches. General real campaigns
+therefore remain disabled until a separately resolved pre-launch approval binds
+the exact campaign and source repository before investigator or Git execution,
+then carries that authority through fixer and tester admission. Existing
+schema-v10 campaigns receive no automatic admission during migration.
 
 ## Development
 
@@ -352,3 +390,4 @@ PYTHONPATH=src python3 -m agent_flow.cli simulate \
 
 See `AGENTS.md` for the complete engineering contract and `CONTINUE.md` for the
 next Phase 2 pickup point.
+# python-ai-agent-flow-
