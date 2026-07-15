@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import os
 from pathlib import Path
 import shutil
 import sqlite3
@@ -14,7 +13,7 @@ import pytest
 
 from agent_flow.evidence_pipeline import EvidencePipelineWorker
 from agent_flow.models import TestHandoff as DomainTestHandoff
-from agent_flow.process_reconciler import DarwinProcessRuntime
+from agent_flow.process_reconciler import DarwinProcessRuntime, ProcessIdentity
 from agent_flow.storage import SQLiteStore
 from agent_flow.workers import WorkerContext
 from agent_flow.worktrees import (
@@ -592,3 +591,23 @@ if __name__ == "__main__":
         ]
         assert all(process["state"] == "stopped" for process in processes)
         assert store.foreign_key_violations() == []
+
+
+def test_worker_context_missing_browser_release_callback_fails_closed() -> None:
+    context = WorkerContext(campaign={}, item={"id": "item"}, job={})
+    identity = ProcessIdentity(
+        process_id=100,
+        process_group_id=100,
+        user_id=0,
+        executable="/usr/bin/python3",
+        start_seconds=1,
+        start_microseconds=0,
+    )
+    with pytest.raises(Exception, match="browser guardian release"):
+        context.browser_guardian_release_fence(identity, "/usr/bin/python3")
+
+
+def test_worker_context_missing_database_query_fence_fails_closed() -> None:
+    context = WorkerContext(campaign={}, item={"id": "item"}, job={})
+    with pytest.raises(Exception, match="database query execution"):
+        context.database_query_execution_fence({"id": "exec"})

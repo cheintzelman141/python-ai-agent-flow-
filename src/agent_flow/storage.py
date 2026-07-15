@@ -54,7 +54,7 @@ from agent_flow.models import (
 )
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 OPEN_JOB_STATUSES = ("pending", "running")
 DEFAULT_REQUIRED_GATES = ("focused_tests", "browser", "database")
 DEFAULT_ROLE_LIMITS = {"investigator": 2, "fixer": 2, "tester": 2}
@@ -566,6 +566,10 @@ class SQLiteStore:
                 for statement in _SCHEMA_V11:
                     connection.execute(statement)
                 connection.execute("PRAGMA user_version = 11")
+            if version < 12:
+                for statement in _SCHEMA_V12:
+                    connection.execute(statement)
+                connection.execute("PRAGMA user_version = 12")
 
     @staticmethod
     def _migrate_workspace_kinds(connection: sqlite3.Connection) -> None:
@@ -995,6 +999,13 @@ class SQLiteStore:
             for field in ("repository_identity", "worktree_identity"):
                 if not isinstance(record[field], dict):
                     raise ValueError("admission identity is not an object")
+            for field in (
+                "browser_evidence_plan_sha256",
+                "database_query_plan_sha256",
+            ):
+                value = record.get(field)
+                if value is not None and _SHA256_PATTERN.fullmatch(str(value)) is None:
+                    raise ValueError("%s changed" % field)
             expected_hashes = {
                 "focused_test_plan_sha256": str(
                     record["focused_test_plan_sha256"]
@@ -3337,6 +3348,65 @@ class SQLiteStore:
             raise LeaseConflict("attempt focused-test admission identity changed")
         return admission
 
+    def _assert_attempt_collector_admission(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        attempt: Mapping[str, Any],
+        collector: str,
+        plan: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        if collector not in {"browser", "database"}:
+            raise LeaseConflict("unknown collector admission kind")
+        if attempt is None or attempt["status"] != "running":
+            raise LeaseConflict("collector admission requires a running attempt")
+        admission = self._assert_attempt_focused_test_admission(connection, job)
+        if admission is None:
+            raise LeaseConflict(
+                "%s execution requires an exact live focused-test admission" % collector
+            )
+        if str(attempt["id"]) != str(job["current_attempt_id"]):
+            raise LeaseConflict("collector attempt is not current")
+        if str(attempt["job_id"]) != str(job["id"]):
+            raise LeaseConflict("collector attempt is outside the job")
+        if str(attempt["focused_test_admission_id"]) != str(admission["id"]):
+            raise LeaseConflict("collector admission identity changed")
+        required_gates = _load(
+            connection.execute(
+                "SELECT required_gates_json FROM work_items WHERE id = ?",
+                (job["work_item_id"],),
+            ).fetchone()["required_gates_json"],
+            [],
+        )
+        if required_gates != list(DEFAULT_REQUIRED_GATES):
+            raise LeaseConflict("collector admission requires the fixed three-gate item")
+        expected_id_field = (
+            "browser_evidence_plan_id" if collector == "browser" else "database_query_plan_id"
+        )
+        expected_hash_field = (
+            "browser_evidence_plan_sha256"
+            if collector == "browser"
+            else "database_query_plan_sha256"
+        )
+        if not admission.get(expected_id_field) or not admission.get(expected_hash_field):
+            raise LeaseConflict("collector plan is not pinned by the admission")
+        if str(plan["id"]) != str(admission[expected_id_field]):
+            raise LeaseConflict("collector plan is not the admitted plan")
+        if str(plan["plan_sha256"]) != str(admission[expected_hash_field]):
+            raise LeaseConflict("collector plan authority changed")
+        if str(plan["work_item_id"]) != str(job["work_item_id"]):
+            raise LeaseConflict("collector plan work item changed")
+        admitted_resource_ids = set(admission["resource_definition_ids"])
+        if str(plan["resource_definition_id"]) not in admitted_resource_ids:
+            raise LeaseConflict("collector resource is not admitted")
+        bindings = {binding["id"]: binding for binding in admission["resource_bindings"]}
+        binding = bindings.get(str(plan["resource_definition_id"]))
+        if binding is None:
+            raise LeaseConflict("collector resource binding is absent")
+        if str(binding["identity_hash"]) != str(plan["resource_identity_hash"]):
+            raise LeaseConflict("collector resource identity changed")
+        return admission
+
     def create_focused_test_admission(
         self,
         campaign_id: str,
@@ -3463,6 +3533,30 @@ class SQLiteStore:
             focused_plan_hash = _sha256_json(
                 self._focused_plan_authority(plan)
             )
+            required_gates_for_pins = _load(item["required_gates_json"], [])
+            browser_plan_id = browser_plan_hash = None
+            database_plan_id = database_plan_hash = None
+            if required_gates_for_pins == list(DEFAULT_REQUIRED_GATES):
+                browser_plan_row = connection.execute(
+                    """SELECT * FROM browser_evidence_plans WHERE work_item_id = ?
+                       ORDER BY plan_number DESC LIMIT 1""",
+                    (work_item_id,),
+                ).fetchone()
+                database_plan_row = connection.execute(
+                    """SELECT * FROM database_query_plans WHERE work_item_id = ?
+                       ORDER BY plan_number DESC LIMIT 1""",
+                    (work_item_id,),
+                ).fetchone()
+                if browser_plan_row is None or database_plan_row is None:
+                    raise TransitionConflict(
+                        "three-gate admission requires exact browser and database plans"
+                    )
+                browser_plan = self._validated_browser_plan_row(connection, browser_plan_row)
+                database_plan = self._validated_database_plan_row(connection, database_plan_row)
+                browser_plan_id = str(browser_plan["id"])
+                browser_plan_hash = str(browser_plan["plan_sha256"])
+                database_plan_id = str(database_plan["id"])
+                database_plan_hash = str(database_plan["plan_sha256"])
             required_resources = sorted(
                 exact_resource_ids
                 + [WORKTREE_RESOURCE_PREFIX + managed_worktree_id]
@@ -3480,6 +3574,10 @@ class SQLiteStore:
                 "managed_worktree_generation": int(worktree["generation"]),
                 "focused_test_plan_id": focused_test_plan_id,
                 "focused_test_plan_sha256": focused_plan_hash,
+                "browser_evidence_plan_id": browser_plan_id,
+                "browser_evidence_plan_sha256": browser_plan_hash,
+                "database_query_plan_id": database_plan_id,
+                "database_query_plan_sha256": database_plan_hash,
                 "campaign_config_sha256": _sha256_json(campaign_config),
                 "job_payload_sha256": hashlib.sha256(
                     str(job["payload_json"]).encode("utf-8")
@@ -3523,6 +3621,8 @@ class SQLiteStore:
                        (id, campaign_id, work_item_id, tester_job_id,
                         managed_worktree_id, managed_worktree_generation,
                         focused_test_plan_id, focused_test_plan_sha256,
+                        browser_evidence_plan_id, browser_evidence_plan_sha256,
+                        database_query_plan_id, database_query_plan_sha256,
                         campaign_config_sha256, job_payload_sha256,
                         required_gates_sha256, repository_identity_json,
                         repository_identity_sha256, worktree_identity_json,
@@ -3532,7 +3632,7 @@ class SQLiteStore:
                         authority_sha256, status, admitted_by, admission_reason,
                         admitted_at, updated_at)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                               ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
+                               ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)""",
                     (
                         admission_id,
                         campaign_id,
@@ -3542,6 +3642,10 @@ class SQLiteStore:
                         int(worktree["generation"]),
                         focused_test_plan_id,
                         focused_plan_hash,
+                        data["browser_evidence_plan_id"],
+                        data["browser_evidence_plan_sha256"],
+                        data["database_query_plan_id"],
+                        data["database_query_plan_sha256"],
                         data["campaign_config_sha256"],
                         data["job_payload_sha256"],
                         data["required_gates_sha256"],
@@ -11086,4 +11190,14 @@ _SCHEMA_V11 = [
        REFERENCES focused_test_admissions(id) ON DELETE RESTRICT""",
     """CREATE INDEX attempts_focused_test_admission
        ON attempts(focused_test_admission_id, status)""",
+]
+
+
+_SCHEMA_V12 = [
+    "ALTER TABLE focused_test_admissions ADD COLUMN browser_evidence_plan_id TEXT REFERENCES browser_evidence_plans(id) ON DELETE RESTRICT",
+    "ALTER TABLE focused_test_admissions ADD COLUMN browser_evidence_plan_sha256 TEXT",
+    "ALTER TABLE focused_test_admissions ADD COLUMN database_query_plan_id TEXT REFERENCES database_query_plans(id) ON DELETE RESTRICT",
+    "ALTER TABLE focused_test_admissions ADD COLUMN database_query_plan_sha256 TEXT",
+    "CREATE INDEX focused_test_admissions_browser_plan ON focused_test_admissions(browser_evidence_plan_id)",
+    "CREATE INDEX focused_test_admissions_database_plan ON focused_test_admissions(database_query_plan_id)",
 ]
