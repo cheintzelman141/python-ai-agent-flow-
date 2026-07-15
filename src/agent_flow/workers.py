@@ -134,8 +134,6 @@ class WorkerContext:
 
         if self._browser_guardian_release_fencer is not None:
             return self._browser_guardian_release_fencer(identity, target_executable)
-        if self._focused_test_guardian_release_fencer is not None:
-            return self._focused_test_guardian_release_fencer(identity, target_executable)
         raise WorkerExecutionError(
             "this worker context cannot authorize browser guardian release"
         )
@@ -255,8 +253,17 @@ class WorkerContext:
         """Revalidate an attempt-pinned database admission immediately before query."""
 
         if self._database_query_execution_authorizer is None:
-            return contract
+            raise WorkerExecutionError(
+                "this worker context cannot authorize database query execution"
+            )
         return self._database_query_execution_authorizer(contract)
+
+    def database_query_execution_fence(
+        self, contract: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Compatibility name for the database admission revalidation fence."""
+
+        return self.authorize_database_query_execution(contract)
 
     def complete_database_query_execution(
         self, result: Mapping[str, Any]
